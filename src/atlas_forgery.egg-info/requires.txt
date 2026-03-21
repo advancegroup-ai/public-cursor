@@ -1,7 +1,0 @@
-numpy
-opencv-python
-onnxruntime
-pillow
-scikit-learn
-tqdm
-insightface

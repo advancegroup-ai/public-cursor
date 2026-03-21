@@ -1,3 +1,0 @@
-[console_scripts]
-atlas-cluster-join = atlas_forgery.cli.cluster_join:main
-atlas-embed-single = atlas_forgery.cli.embed_single:main
