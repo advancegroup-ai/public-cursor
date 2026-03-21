@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/atlas_forgery/__init__.py
+src/atlas_forgery.egg-info/PKG-INFO
+src/atlas_forgery.egg-info/SOURCES.txt
+src/atlas_forgery.egg-info/dependency_links.txt
+src/atlas_forgery.egg-info/entry_points.txt
+src/atlas_forgery.egg-info/requires.txt
+src/atlas_forgery.egg-info/top_level.txt
+src/atlas_forgery/cli/cluster_join.py
+src/atlas_forgery/cli/embed_single.py
+src/atlas_forgery/embeddings/arcface_insightface.py
+src/atlas_forgery/embeddings/doc_front_bg_clip_onnx.py
