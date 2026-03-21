@@ -1,0 +1,23 @@
+ [project]
+ name = "atlas-forgery"
+ version = "0.1.0"
+ description = "Prototype utilities for document forgery detection embeddings"
+ requires-python = ">=3.10"
+ dependencies = [
+   "numpy",
+   "opencv-python",
+   "onnxruntime",
+   "pillow",
+ ]
+ 
+ [project.optional-dependencies]
+ face = [
+   "insightface",
+   "onnxruntime-gpu; platform_system == 'Linux'",
+ ]
+ 
+ [tool.setuptools]
+ package-dir = {"" = "src"}
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
