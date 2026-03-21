@@ -1,0 +1,30 @@
+[project]
+name = "atlas-forgery"
+version = "0.1.0"
+description = "Portable document forgery embedding + clustering utilities"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "onnxruntime",
+  "pillow",
+  "scikit-learn",
+  "tqdm",
+  "insightface",
+]
+
+[project.scripts]
+atlas-embed-single = "atlas_forgery.cli.embed_single:main"
+atlas-cluster-join = "atlas_forgery.cli.cluster_join:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

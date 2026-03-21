@@ -1,3 +1,17 @@
+Metadata-Version: 2.4
+Name: atlas-forgery
+Version: 0.1.0
+Summary: Portable document forgery embedding + clustering utilities
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: opencv-python
+Requires-Dist: onnxruntime
+Requires-Dist: pillow
+Requires-Dist: scikit-learn
+Requires-Dist: tqdm
+Requires-Dist: insightface
+
 # public-cursor
 
 Workspace repository for Cursor Cloud Agent API tasks.
