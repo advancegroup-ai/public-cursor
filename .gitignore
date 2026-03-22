@@ -3,4 +3,8 @@ node_modules/
 .env.local
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
 .DS_Store
