@@ -1,0 +1,15 @@
+numpy>=1.26
+
+[dev]
+pytest>=8.0
+ruff>=0.3.0
+
+[face]
+insightface>=0.7.3
+
+[onnx]
+onnxruntime>=1.17
+
+[vision]
+opencv-python>=4.8
+pillow>=10.0

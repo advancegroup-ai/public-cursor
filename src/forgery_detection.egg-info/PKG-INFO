@@ -1,0 +1,23 @@
+Metadata-Version: 2.4
+Name: forgery-detection
+Version: 0.1.0
+Summary: Utilities for document forgery analysis (embeddings, joins, clustering).
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.26
+Provides-Extra: onnx
+Requires-Dist: onnxruntime>=1.17; extra == "onnx"
+Provides-Extra: vision
+Requires-Dist: opencv-python>=4.8; extra == "vision"
+Requires-Dist: pillow>=10.0; extra == "vision"
+Provides-Extra: face
+Requires-Dist: insightface>=0.7.3; extra == "face"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.3.0; extra == "dev"
+
+# public-cursor
+
+Workspace repository for Cursor Cloud Agent API tasks.
+
+This repo is used as a sandbox by [Vibe Track](https://github.com/simontt88/vibe-track-open) to run Cursor Cloud Agents programmatically.
