@@ -1,3 +1,20 @@
+Metadata-Version: 2.4
+Name: atlas-forgery
+Version: 0.1.0
+Summary: Utilities for face-masked document embeddings and clustering.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: pillow>=10.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"
+Provides-Extra: onnx
+Requires-Dist: onnxruntime>=1.17; extra == "onnx"
+Provides-Extra: insightface
+Requires-Dist: insightface>=0.7; extra == "insightface"
+Requires-Dist: opencv-python>=4.8; extra == "insightface"
+
 # public-cursor
 
 Workspace repository for Cursor Cloud Agent API tasks.
