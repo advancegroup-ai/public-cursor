@@ -1,0 +1,41 @@
+ [build-system]
+ requires = ["setuptools>=69", "wheel"]
+ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "forgery-detection"
+ version = "0.1.0"
+ description = "Document forgery detection utilities: background embeddings, face embeddings, clustering."
+ readme = "README.md"
+ requires-python = ">=3.10"
+ dependencies = [
+   "numpy>=1.24",
+   "pillow>=10",
+ ]
+ 
+ [project.optional-dependencies]
+ dev = [
+   "pytest>=8",
+ ]
+ onnx = [
+   "onnxruntime>=1.17",
+ ]
+ insightface = [
+   "insightface>=0.7",
+   "opencv-python-headless>=4.9",
+ ]
+ 
+ [project.scripts]
+ forgery-embed-doc-front = "forgery_detection.cli.embed_doc_front:main"
+ forgery-embed-face = "forgery_detection.cli.embed_face:main"
+ forgery-cluster-vectors = "forgery_detection.cli.cluster_vectors:main"
+ 
+ [tool.setuptools]
+ package-dir = {"" = "src"}
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ addopts = "-q"
