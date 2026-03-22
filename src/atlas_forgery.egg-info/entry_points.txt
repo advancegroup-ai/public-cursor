@@ -1,0 +1,4 @@
+[console_scripts]
+atlas-cluster = atlas_forgery.cli.cluster:main
+atlas-docfront-embed = atlas_forgery.cli.docfront_embed:main
+atlas-face-embed = atlas_forgery.cli.face_embed:main
