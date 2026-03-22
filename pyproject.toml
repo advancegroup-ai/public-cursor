@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-forgery"
+version = "0.1.0"
+description = "Document forgery analysis utilities (face-masked doc embeddings, face embeddings, clustering)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pillow>=10",
+]
+
+[project.scripts]
+atlas-cluster = "atlas_forgery.cli.cluster:main"
+atlas-doc-embed = "atlas_forgery.cli.doc_embed:main"
+atlas-face-embed = "atlas_forgery.cli.face_embed:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.5",
+]
+onnx = [
+  "onnxruntime>=1.16",
+]
+insightface = [
+  "insightface>=0.7.3",
+  "opencv-python>=4.8",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
