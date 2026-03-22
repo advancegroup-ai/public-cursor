@@ -1,0 +1,40 @@
+ [build-system]
+ requires = ["setuptools>=69", "wheel"]
+ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "forgery-detection"
+ version = "0.1.0"
+ description = "Utilities for document forgery detection via embeddings and clustering."
+ readme = "README.md"
+ requires-python = ">=3.10"
+ license = { text = "MIT" }
+ authors = [{ name = "Cursor Cloud Agent" }]
+ dependencies = [
+   "numpy>=1.24",
+ ]
+ 
+ [project.optional-dependencies]
+ cli = [
+   "onnxruntime>=1.16",
+   "opencv-python-headless>=4.8",
+   "pillow>=10.0",
+ ]
+ dev = [
+   "pytest>=7.0",
+ ]
+ 
+ [project.scripts]
+ forgery-embed-docfront = "forgery_detection.cli.embed_docfront:main"
+ forgery-embed-faces = "forgery_detection.cli.embed_faces:main"
+ forgery-cluster-vectors = "forgery_detection.cli.cluster_vectors:main"
+ 
+ [tool.setuptools]
+ package-dir = {"" = "src"}
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ addopts = "-q"
