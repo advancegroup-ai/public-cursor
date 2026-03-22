@@ -1,8 +1,0 @@
-{
-  "npz": "tmp_smoke/embeddings.npz",
-  "expected_intersection": [
-    "b",
-    "c",
-    "d"
-  ]
-}
