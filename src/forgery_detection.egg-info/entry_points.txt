@@ -1,0 +1,3 @@
+[console_scripts]
+forgery-cluster-vectors = forgery_detection.cli.cluster_vectors:main
+forgery-embed-doc-front = forgery_detection.cli.embed_doc_front:main

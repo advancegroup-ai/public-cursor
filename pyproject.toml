@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forgery-detection"
+version = "0.1.0"
+description = "Document forgery detection utilities (embeddings + clustering)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "simontt88" }]
+dependencies = [
+  "numpy>=1.24",
+  "pillow>=10",
+]
+
+[project.optional-dependencies]
+onnx = ["onnxruntime>=1.17"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+forgery-embed-doc-front = "forgery_detection.cli.embed_doc_front:main"
+forgery-cluster-vectors = "forgery_detection.cli.cluster_vectors:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
