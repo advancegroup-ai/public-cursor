@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-forgery"
+version = "0.1.0"
+description = "Utilities for document-forgery analysis: face-masked doc embeddings, face embeddings, and clustering."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Atlas (Cursor Cloud Agent)" }]
+dependencies = [
+  "numpy>=1.24",
+  "pillow>=10",
+]
+
+[project.optional-dependencies]
+onnx = ["onnxruntime>=1.16"]
+insightface = ["insightface>=0.7"]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[project.scripts]
+atlas-doc-embed = "atlas_forgery.cli.doc_embed:main"
+atlas-face-embed = "atlas_forgery.cli.face_embed:main"
+atlas-cluster = "atlas_forgery.cli.cluster:main"
+atlas-join = "atlas_forgery.cli.join:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
