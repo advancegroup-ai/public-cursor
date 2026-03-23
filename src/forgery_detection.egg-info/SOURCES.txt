@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/forgery_detection/__init__.py
+src/forgery_detection/clustering.py
+src/forgery_detection/image_ops.py
+src/forgery_detection/join.py
+src/forgery_detection/npz_store.py
+src/forgery_detection.egg-info/PKG-INFO
+src/forgery_detection.egg-info/SOURCES.txt
+src/forgery_detection.egg-info/dependency_links.txt
+src/forgery_detection.egg-info/requires.txt
+src/forgery_detection.egg-info/top_level.txt
+tests/test_core.py
