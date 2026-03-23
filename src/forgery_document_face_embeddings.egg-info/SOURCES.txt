@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/forgery_document_face_embeddings/__init__.py
+src/forgery_document_face_embeddings/core.py
+src/forgery_document_face_embeddings/embedders.py
+src/forgery_document_face_embeddings.egg-info/PKG-INFO
+src/forgery_document_face_embeddings.egg-info/SOURCES.txt
+src/forgery_document_face_embeddings.egg-info/dependency_links.txt
+src/forgery_document_face_embeddings.egg-info/requires.txt
+src/forgery_document_face_embeddings.egg-info/top_level.txt
+tests/test_core.py

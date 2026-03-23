@@ -1,3 +1,21 @@
+Metadata-Version: 2.4
+Name: forgery-document-face-embeddings
+Version: 0.1.0
+Summary: Utilities for doc background + face embeddings for forgery analysis.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Provides-Extra: onnx
+Requires-Dist: onnxruntime>=1.16; extra == "onnx"
+Provides-Extra: cv
+Requires-Dist: opencv-python>=4.8; extra == "cv"
+Provides-Extra: face
+Requires-Dist: insightface>=0.7; extra == "face"
+Requires-Dist: opencv-python>=4.8; extra == "face"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.3; extra == "dev"
+
 # public-cursor
 
 Workspace repository for Cursor Cloud Agent API tasks.
