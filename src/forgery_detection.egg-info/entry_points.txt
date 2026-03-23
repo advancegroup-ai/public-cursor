@@ -1,3 +1,0 @@
-[console_scripts]
-forgery-cluster = forgery_detection.cli.cluster:main
-forgery-npz-join = forgery_detection.cli.npz_join:main
