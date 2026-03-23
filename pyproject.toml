@@ -1,0 +1,27 @@
+[project]
+name = "atlas-doc-forgery"
+version = "0.1.0"
+description = "Reference pipeline for doc_front background + face embeddings."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "pillow",
+  "opencv-python",
+  "onnxruntime",
+  "scikit-learn",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+atlas-forgery = "atlas_doc_forgery.cli:main"
