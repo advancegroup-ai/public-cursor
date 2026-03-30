@@ -1,0 +1,7 @@
+commit	balanced_acc	status	description
+a37c223	0.654762	keep	baseline pixel statistics
+a898f17	1.000000	keep	comprehensive features (noise, FFT stripe, color space, freq, contrast) + RF 200 trees
+86169b5	1.000000	keep	simplified 39 features (noise, FFT, color, contrast) + RF 100 trees
+33afa9c	1.000000	keep	minimal 18 features (noise, color diffs, channel uniformity, FFT stripe, contrast) + RF 50 trees
+b07ee6b	0.659524	discard	ultra-minimal 10 features + LogisticRegression (too linear for these features)
+ecdc99d	1.000000	keep	ultra-minimal 10 features (5 per face image) + RF 50 trees - SIMPLEST PERFECT SOLUTION

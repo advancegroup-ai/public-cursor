@@ -1,12 +1,14 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Baseline: simple pixel statistics features + logistic regression.
+Experiment 5: Minimal features with RandomForest.
+
+Targets the key synthetic attack signatures with fewest possible features.
 
 Usage: python analyze.py
 """
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from prepare import (
     load_dataset, load_image, get_train_test_split,
     evaluate, print_results, print_detailed_report,
@@ -16,29 +18,39 @@ from prepare import (
 # Feature extraction (MODIFY THIS)
 # ---------------------------------------------------------------------------
 
-def extract_features(sample: dict) -> np.ndarray:
-    """
-    Extract features from a single sample (3 images).
-    Returns a 1D feature vector.
-    """
-    features = []
+def _minimal_features(img):
+    """5 features targeting the core attack signatures."""
+    gray = img.mean(axis=2)
+    r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
 
+    lap = np.zeros_like(gray)
+    lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
+                        gray[1:-1, :-2] + gray[1:-1, 2:] -
+                        4 * gray[1:-1, 1:-1])
+    noise = float(np.abs(lap).mean())
+
+    bw_fraction = float((np.std(img, axis=2) < 0.01).mean())
+
+    blue_shift = float(b.mean() - r.mean())
+
+    contrast = float(np.percentile(gray, 95) - np.percentile(gray, 5))
+
+    row_means = gray.mean(axis=1)
+    fft_row = np.abs(np.fft.rfft(row_means - row_means.mean()))
+    n = len(fft_row)
+    stripe = float(fft_row[n // 3]) if n > 3 else 0.0
+
+    return [noise, bw_fraction, blue_shift, contrast, stripe]
+
+
+def extract_features(sample: dict) -> np.ndarray:
+    """Extract features from a single sample."""
+    features = []
     far = load_image(sample["far"])
     near = load_image(sample["near"])
 
     for img in [far, near]:
-        features.append(img.mean())
-        features.append(img.std())
-        for ch in range(3):
-            features.append(img[:, :, ch].mean())
-            features.append(img[:, :, ch].std())
-
-    if sample["card"] is not None:
-        card = load_image(sample["card"])
-        features.append(card.mean())
-        features.append(card.std())
-    else:
-        features.extend([0.0, 0.0])
+        features.extend(_minimal_features(img))
 
     return np.array(features, dtype=np.float32)
 
@@ -49,7 +61,14 @@ def extract_features(sample: dict) -> np.ndarray:
 
 def build_classifier():
     """Build and return a classifier."""
-    return LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced")
+    return RandomForestClassifier(
+        n_estimators=50,
+        max_depth=None,
+        min_samples_leaf=2,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +89,9 @@ def main():
     print("Extracting features...")
     X_train = np.array([extract_features(s) for s in train_samples])
     X_test = np.array([extract_features(s) for s in test_samples])
+
+    X_train = np.nan_to_num(X_train, nan=0.0, posinf=1.0, neginf=-1.0)
+    X_test = np.nan_to_num(X_test, nan=0.0, posinf=1.0, neginf=-1.0)
 
     num_features = X_train.shape[1]
     print(f"Features: {num_features}")
