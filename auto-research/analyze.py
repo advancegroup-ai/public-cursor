@@ -1,8 +1,8 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 19: 2 noise features + depth-limited DecisionTree (max_depth=3).
+Experiment 22: Haar wavelet high-frequency energy + DecisionTree.
 
-Testing how shallow a tree can be while still perfect.
+Alternative to Laplacian: high-frequency energy via simple Haar decomposition.
 
 Usage: python analyze.py
 """
@@ -18,24 +18,29 @@ from prepare import (
 # Feature extraction (MODIFY THIS)
 # ---------------------------------------------------------------------------
 
-def _noise_feature(img):
-    """Laplacian noise level."""
+def _haar_energy(img):
+    """High-frequency energy from simple Haar-like decomposition."""
     gray = img.mean(axis=2)
-    lap = np.zeros_like(gray)
-    lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
-                        gray[1:-1, :-2] + gray[1:-1, 2:] -
-                        4 * gray[1:-1, 1:-1])
-    return [float(np.abs(lap).mean())]
+    h, w = gray.shape
+    h2, w2 = h // 2, w // 2
+    even_rows = gray[:h2 * 2:2, :]
+    odd_rows = gray[1:h2 * 2:2, :]
+    detail_h = (even_rows - odd_rows)[:, :w2 * 2]
+    even_cols = gray[:, :w2 * 2:2]
+    odd_cols = gray[:, 1:w2 * 2:2]
+    detail_v = (even_cols - odd_cols)[:h2 * 2, :]
+    energy = float(np.mean(detail_h ** 2) + np.mean(detail_v ** 2))
+    return [energy]
 
 
 def extract_features(sample: dict) -> np.ndarray:
-    """Extract noise features from far and near images."""
+    """Extract wavelet features from far and near images."""
     features = []
     far = load_image(sample["far"])
     near = load_image(sample["near"])
 
     for img in [far, near]:
-        features.extend(_noise_feature(img))
+        features.extend(_haar_energy(img))
 
     return np.array(features, dtype=np.float32)
 
@@ -47,7 +52,7 @@ def extract_features(sample: dict) -> np.ndarray:
 def build_classifier():
     """Build and return a classifier."""
     return DecisionTreeClassifier(
-        max_depth=3,
+        max_depth=None,
         min_samples_leaf=2,
         class_weight="balanced",
         random_state=42,
