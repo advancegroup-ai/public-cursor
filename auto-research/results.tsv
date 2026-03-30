@@ -6,3 +6,4 @@ a898f17	1.000000	keep	comprehensive features (noise, FFT stripe, color space, fr
 b07ee6b	0.659524	discard	ultra-minimal 10 features + LogisticRegression (too linear for these features)
 ecdc99d	1.000000	keep	ultra-minimal 10 features (5 per face image) + RF 50 trees - SIMPLEST PERFECT SOLUTION
 e0f752a	1.000000	keep	ultra-minimal 6 features (noise, bw_fraction, blue_shift per image) + RF 50
+55ea557	1.000000	keep	4 features (noise, bw_fraction per image) + RF 50 - even simpler
