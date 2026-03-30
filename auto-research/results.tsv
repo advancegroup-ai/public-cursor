@@ -16,3 +16,5 @@ ef63ed3	1.000000	keep	4 gradient features (mean+std per image) + DecisionTree - 
 4e51507	1.000000	keep	2 gradient-mean features + DecisionTree - minimal alternate
 bc82451	0.614286	discard	HSV saturation features + DecisionTree - color alone not enough
 935eee9	1.000000	keep	2 noise features + SVM RBF - different classifier also perfect
+18dc5ed	0.983333	discard	2 noise features + kNN k=3 - close but not perfect
+099801f	1.000000	keep	2 noise features + DecisionTree max_depth=3 - shallow tree perfect
