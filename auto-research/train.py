@@ -225,5 +225,5 @@ def train():
     print(f"Results written to {RESULTS_FILE}")
 
 
-if __name__ == "__main__":
-    train()
+# Always run when executed (pipeline uses exec(), not __main__)
+train()
