@@ -27,3 +27,6 @@ f8bcfd9	0.950000	discard	2D FFT hf-ratio features + DecisionTree - not perfect
 5c5eb4a	0.876190	discard	LBP variance features + DT - texture alone not enough
 a618b6a	0.838095	discard	far-near consistency features + DT - not enough
 c8ca6ed	0.966667	discard	AdaBoost 3 stumps + 2 noise - close but not perfect
+--- iter2 DGX1 deep learning experiments (real 2586-sample dataset) ---
+6dc40d3	0.976659	keep	[DGX1] ResNet18 pretrained 6ch (far+near) baseline, Adam lr=1e-4, 15 epochs
+ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders) + OneCycleLR - worse than single stream
