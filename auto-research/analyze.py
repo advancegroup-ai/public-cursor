@@ -1,8 +1,8 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 7: Ultra-minimal 3 features per image (6 total) + RF 50.
+Experiment 8: 2 features per image (4 total) + RF 50.
 
-Testing if noise, bw_fraction, blue_shift alone suffice without contrast/stripe.
+Testing if noise + bw_fraction alone suffice.
 
 Usage: python analyze.py
 """
@@ -19,9 +19,8 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 def _minimal_features(img):
-    """3 features targeting core attack signatures."""
+    """2 features targeting core attack signatures."""
     gray = img.mean(axis=2)
-    r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
 
     lap = np.zeros_like(gray)
     lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
@@ -31,9 +30,7 @@ def _minimal_features(img):
 
     bw_fraction = float((np.std(img, axis=2) < 0.01).mean())
 
-    blue_shift = float(b.mean() - r.mean())
-
-    return [noise, bw_fraction, blue_shift]
+    return [noise, bw_fraction]
 
 
 def extract_features(sample: dict) -> np.ndarray:
