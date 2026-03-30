@@ -1,8 +1,8 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 5: Minimal features with RandomForest.
+Experiment 7: Ultra-minimal 3 features per image (6 total) + RF 50.
 
-Targets the key synthetic attack signatures with fewest possible features.
+Testing if noise, bw_fraction, blue_shift alone suffice without contrast/stripe.
 
 Usage: python analyze.py
 """
@@ -19,7 +19,7 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 def _minimal_features(img):
-    """5 features targeting the core attack signatures."""
+    """3 features targeting core attack signatures."""
     gray = img.mean(axis=2)
     r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
 
@@ -33,14 +33,7 @@ def _minimal_features(img):
 
     blue_shift = float(b.mean() - r.mean())
 
-    contrast = float(np.percentile(gray, 95) - np.percentile(gray, 5))
-
-    row_means = gray.mean(axis=1)
-    fft_row = np.abs(np.fft.rfft(row_means - row_means.mean()))
-    n = len(fft_row)
-    stripe = float(fft_row[n // 3]) if n > 3 else 0.0
-
-    return [noise, bw_fraction, blue_shift, contrast, stripe]
+    return [noise, bw_fraction, blue_shift]
 
 
 def extract_features(sample: dict) -> np.ndarray:
