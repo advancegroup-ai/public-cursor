@@ -18,3 +18,5 @@ bc82451	0.614286	discard	HSV saturation features + DecisionTree - color alone no
 935eee9	1.000000	keep	2 noise features + SVM RBF - different classifier also perfect
 18dc5ed	0.983333	discard	2 noise features + kNN k=3 - close but not perfect
 099801f	1.000000	keep	2 noise features + DecisionTree max_depth=3 - shallow tree perfect
+0a12cb6	0.750000	discard	2 noise features + decision stump max_depth=1 - too simple
+115dfb6	0.966667	discard	2 noise features + DT max_depth=2 - not quite perfect
