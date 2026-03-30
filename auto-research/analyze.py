@@ -1,14 +1,14 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 15: Gradient mean only (2 features) + DecisionTree.
+Experiment 17: 2 Laplacian noise features + SVM (RBF kernel).
 
-Simplify gradient approach to single feature per image.
+Testing if SVM works as well as tree-based methods.
 
 Usage: python analyze.py
 """
 
 import numpy as np
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
 from prepare import (
     load_dataset, load_image, get_train_test_split,
     evaluate, print_results, print_detailed_report,
@@ -18,24 +18,24 @@ from prepare import (
 # Feature extraction (MODIFY THIS)
 # ---------------------------------------------------------------------------
 
-def _gradient_features(img):
-    """Single gradient feature: mean magnitude."""
+def _noise_feature(img):
+    """Laplacian noise level."""
     gray = img.mean(axis=2)
-    gx = gray[:, 1:] - gray[:, :-1]
-    gy = gray[1:, :] - gray[:-1, :]
-    h, w = min(gx.shape[0], gy.shape[0]), min(gx.shape[1], gy.shape[1])
-    mag = np.sqrt(gx[:h, :w] ** 2 + gy[:h, :w] ** 2)
-    return [float(mag.mean())]
+    lap = np.zeros_like(gray)
+    lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
+                        gray[1:-1, :-2] + gray[1:-1, 2:] -
+                        4 * gray[1:-1, 1:-1])
+    return [float(np.abs(lap).mean())]
 
 
 def extract_features(sample: dict) -> np.ndarray:
-    """Extract gradient features from far and near images."""
+    """Extract noise features from far and near images."""
     features = []
     far = load_image(sample["far"])
     near = load_image(sample["near"])
 
     for img in [far, near]:
-        features.extend(_gradient_features(img))
+        features.extend(_noise_feature(img))
 
     return np.array(features, dtype=np.float32)
 
@@ -46,9 +46,8 @@ def extract_features(sample: dict) -> np.ndarray:
 
 def build_classifier():
     """Build and return a classifier."""
-    return DecisionTreeClassifier(
-        max_depth=None,
-        min_samples_leaf=2,
+    return SVC(
+        kernel="rbf",
         class_weight="balanced",
         random_state=42,
     )
