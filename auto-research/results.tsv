@@ -5,3 +5,28 @@ a898f17	1.000000	keep	comprehensive features (noise, FFT stripe, color space, fr
 33afa9c	1.000000	keep	minimal 18 features (noise, color diffs, channel uniformity, FFT stripe, contrast) + RF 50 trees
 b07ee6b	0.659524	discard	ultra-minimal 10 features + LogisticRegression (too linear for these features)
 ecdc99d	1.000000	keep	ultra-minimal 10 features (5 per face image) + RF 50 trees - SIMPLEST PERFECT SOLUTION
+e0f752a	1.000000	keep	ultra-minimal 6 features (noise, bw_fraction, blue_shift per image) + RF 50
+55ea557	1.000000	keep	4 features (noise, bw_fraction per image) + RF 50 - even simpler
+fa4615d	0.550000	discard	2 features (bw_fraction per image) + RF 50 - too few
+5d1d5b6	1.000000	keep	2 features (Laplacian noise per image) + RF 50 - SIMPLEST PERFECT
+7124849	0.983333	discard	1 feature (noise from far only) + RF 50 - close but not perfect
+7b17be8	1.000000	keep	2 noise features + single DecisionTree - simpler than RF
+f5eb966	0.783333	discard	threshold on mean noise (no sklearn) - too simple
+ef63ed3	1.000000	keep	4 gradient features (mean+std per image) + DecisionTree - alternate approach
+4e51507	1.000000	keep	2 gradient-mean features + DecisionTree - minimal alternate
+bc82451	0.614286	discard	HSV saturation features + DecisionTree - color alone not enough
+935eee9	1.000000	keep	2 noise features + SVM RBF - different classifier also perfect
+18dc5ed	0.983333	discard	2 noise features + kNN k=3 - close but not perfect
+099801f	1.000000	keep	2 noise features + DecisionTree max_depth=3 - shallow tree perfect
+0a12cb6	0.750000	discard	2 noise features + decision stump max_depth=1 - too simple
+115dfb6	0.966667	discard	2 noise features + DT max_depth=2 - not quite perfect
+a003f65	1.000000	keep	2 Haar wavelet energy features + DecisionTree - third alternate approach perfect
+f8bcfd9	0.950000	discard	2D FFT hf-ratio features + DecisionTree - not perfect
+67ffc23	1.000000	keep	2 noise features + GradientBoosting 10 trees - yet another perfect method
+3f452b7	0.983333	discard	LogReg + poly degree=3 noise features - 0.983 not perfect
+5c5eb4a	0.876190	discard	LBP variance features + DT - texture alone not enough
+a618b6a	0.838095	discard	far-near consistency features + DT - not enough
+c8ca6ed	0.966667	discard	AdaBoost 3 stumps + 2 noise - close but not perfect
+--- iter2 DGX1 deep learning experiments (real 2586-sample dataset) ---
+6dc40d3	0.976659	keep	[DGX1] ResNet18 pretrained 6ch (far+near) baseline, Adam lr=1e-4, 15 epochs
+ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders) + OneCycleLR - worse than single stream
