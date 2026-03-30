@@ -1,14 +1,14 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 17: 2 Laplacian noise features + SVM (RBF kernel).
+Experiment 19: 2 noise features + depth-limited DecisionTree (max_depth=3).
 
-Testing if SVM works as well as tree-based methods.
+Testing how shallow a tree can be while still perfect.
 
 Usage: python analyze.py
 """
 
 import numpy as np
-from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
 from prepare import (
     load_dataset, load_image, get_train_test_split,
     evaluate, print_results, print_detailed_report,
@@ -46,8 +46,9 @@ def extract_features(sample: dict) -> np.ndarray:
 
 def build_classifier():
     """Build and return a classifier."""
-    return SVC(
-        kernel="rbf",
+    return DecisionTreeClassifier(
+        max_depth=3,
+        min_samples_leaf=2,
         class_weight="balanced",
         random_state=42,
     )
