@@ -1,6 +1,6 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 2: Simplified feature set targeting key attack signatures.
+Experiment 3: Minimal feature set targeting the key attack signatures.
 
 Usage: python analyze.py
 """
@@ -16,40 +16,33 @@ from prepare import (
 # Feature extraction (MODIFY THIS)
 # ---------------------------------------------------------------------------
 
-def _core_features(img):
-    """Core per-image features: stats + noise + color + contrast."""
+def _minimal_features(img):
+    """Minimal per-image features targeting synthetic attack signatures."""
     features = []
     r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
     gray = img.mean(axis=2)
 
-    features.append(float(gray.mean()))
     features.append(float(gray.std()))
 
-    for ch in [r, g, b]:
-        features.append(float(ch.mean()))
-        features.append(float(ch.std()))
+    features.append(float(b.mean() - r.mean()))
+    features.append(float(g.mean() - r.mean()))
 
-    features.append(float(r.mean() - b.mean()))
-    features.append(float(g.mean() - b.mean()))
+    channel_std = np.std(img, axis=2)
+    features.append(float(channel_std.mean()))
+    features.append(float((channel_std < 0.01).mean()))
 
     lap = np.zeros_like(gray)
     lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
                         gray[1:-1, :-2] + gray[1:-1, 2:] -
                         4 * gray[1:-1, 1:-1])
     features.append(float(np.abs(lap).mean()))
-    features.append(float(lap.var()))
 
     features.append(float(np.percentile(gray, 95) - np.percentile(gray, 5)))
-
-    channel_std = np.std(img, axis=2)
-    features.append(float(channel_std.mean()))
-    features.append(float((channel_std < 0.01).mean()))
 
     row_means = gray.mean(axis=1)
     fft_row = np.abs(np.fft.rfft(row_means - row_means.mean()))
     n = len(fft_row)
     features.append(float(fft_row[n // 3]) if n > 3 else 0.0)
-    features.append(float(fft_row[1:].max()) if n > 1 else 0.0)
 
     return features
 
@@ -62,19 +55,15 @@ def extract_features(sample: dict) -> np.ndarray:
     near = load_image(sample["near"])
 
     for img in [far, near]:
-        features.extend(_core_features(img))
-
-    features.append(float(np.abs(far.mean() - near.mean())))
-    features.append(float(np.abs(far.std() - near.std())))
+        features.extend(_minimal_features(img))
 
     if sample["card"] is not None:
         card = load_image(sample["card"])
         features.append(float(card.mean()))
-        features.append(float(card.std()))
         features.append(float(np.percentile(card.mean(axis=2), 95) -
                                np.percentile(card.mean(axis=2), 5)))
     else:
-        features.extend([0.0, 0.0, 0.0])
+        features.extend([0.0, 0.0])
 
     return np.array(features, dtype=np.float32)
 
@@ -86,7 +75,7 @@ def extract_features(sample: dict) -> np.ndarray:
 def build_classifier():
     """Build and return a classifier."""
     return RandomForestClassifier(
-        n_estimators=100,
+        n_estimators=50,
         max_depth=None,
         min_samples_leaf=2,
         class_weight="balanced",
