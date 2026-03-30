@@ -11,3 +11,5 @@ fa4615d	0.550000	discard	2 features (bw_fraction per image) + RF 50 - too few
 5d1d5b6	1.000000	keep	2 features (Laplacian noise per image) + RF 50 - SIMPLEST PERFECT
 7124849	0.983333	discard	1 feature (noise from far only) + RF 50 - close but not perfect
 7b17be8	1.000000	keep	2 noise features + single DecisionTree - simpler than RF
+f5eb966	0.783333	discard	threshold on mean noise (no sklearn) - too simple
+ef63ed3	1.000000	keep	4 gradient features (mean+std per image) + DecisionTree - alternate approach
