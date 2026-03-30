@@ -1,9 +1,8 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 14: Gradient histogram features + DecisionTree.
+Experiment 15: Gradient mean only (2 features) + DecisionTree.
 
-Completely different approach: use gradient magnitude distribution
-instead of Laplacian noise. Tests robustness of alternative features.
+Simplify gradient approach to single feature per image.
 
 Usage: python analyze.py
 """
@@ -20,13 +19,13 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 def _gradient_features(img):
-    """Gradient-based features: magnitude mean and std."""
+    """Single gradient feature: mean magnitude."""
     gray = img.mean(axis=2)
     gx = gray[:, 1:] - gray[:, :-1]
     gy = gray[1:, :] - gray[:-1, :]
     h, w = min(gx.shape[0], gy.shape[0]), min(gx.shape[1], gy.shape[1])
     mag = np.sqrt(gx[:h, :w] ** 2 + gy[:h, :w] ** 2)
-    return [float(mag.mean()), float(mag.std())]
+    return [float(mag.mean())]
 
 
 def extract_features(sample: dict) -> np.ndarray:
