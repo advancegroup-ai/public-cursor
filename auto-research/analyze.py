@@ -1,14 +1,14 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 22: Haar wavelet high-frequency energy + DecisionTree.
+Experiment 24: 2 Laplacian noise features + GradientBoosting (n=10).
 
-Alternative to Laplacian: high-frequency energy via simple Haar decomposition.
+Testing gradient boosting as a different ensemble method.
 
 Usage: python analyze.py
 """
 
 import numpy as np
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import GradientBoostingClassifier
 from prepare import (
     load_dataset, load_image, get_train_test_split,
     evaluate, print_results, print_detailed_report,
@@ -18,29 +18,24 @@ from prepare import (
 # Feature extraction (MODIFY THIS)
 # ---------------------------------------------------------------------------
 
-def _haar_energy(img):
-    """High-frequency energy from simple Haar-like decomposition."""
+def _noise_feature(img):
+    """Laplacian noise level."""
     gray = img.mean(axis=2)
-    h, w = gray.shape
-    h2, w2 = h // 2, w // 2
-    even_rows = gray[:h2 * 2:2, :]
-    odd_rows = gray[1:h2 * 2:2, :]
-    detail_h = (even_rows - odd_rows)[:, :w2 * 2]
-    even_cols = gray[:, :w2 * 2:2]
-    odd_cols = gray[:, 1:w2 * 2:2]
-    detail_v = (even_cols - odd_cols)[:h2 * 2, :]
-    energy = float(np.mean(detail_h ** 2) + np.mean(detail_v ** 2))
-    return [energy]
+    lap = np.zeros_like(gray)
+    lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
+                        gray[1:-1, :-2] + gray[1:-1, 2:] -
+                        4 * gray[1:-1, 1:-1])
+    return [float(np.abs(lap).mean())]
 
 
 def extract_features(sample: dict) -> np.ndarray:
-    """Extract wavelet features from far and near images."""
+    """Extract noise features from far and near images."""
     features = []
     far = load_image(sample["far"])
     near = load_image(sample["near"])
 
     for img in [far, near]:
-        features.extend(_haar_energy(img))
+        features.extend(_noise_feature(img))
 
     return np.array(features, dtype=np.float32)
 
@@ -51,10 +46,9 @@ def extract_features(sample: dict) -> np.ndarray:
 
 def build_classifier():
     """Build and return a classifier."""
-    return DecisionTreeClassifier(
-        max_depth=None,
-        min_samples_leaf=2,
-        class_weight="balanced",
+    return GradientBoostingClassifier(
+        n_estimators=10,
+        max_depth=3,
         random_state=42,
     )
 
