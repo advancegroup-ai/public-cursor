@@ -9,3 +9,5 @@ e0f752a	1.000000	keep	ultra-minimal 6 features (noise, bw_fraction, blue_shift p
 55ea557	1.000000	keep	4 features (noise, bw_fraction per image) + RF 50 - even simpler
 fa4615d	0.550000	discard	2 features (bw_fraction per image) + RF 50 - too few
 5d1d5b6	1.000000	keep	2 features (Laplacian noise per image) + RF 50 - SIMPLEST PERFECT
+7124849	0.983333	discard	1 feature (noise from far only) + RF 50 - close but not perfect
+7b17be8	1.000000	keep	2 noise features + single DecisionTree - simpler than RF
