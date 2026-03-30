@@ -1,8 +1,9 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 12: 2 noise features + single DecisionTree.
+Experiment 14: Gradient histogram features + DecisionTree.
 
-Testing if a single tree suffices (simpler than RF ensemble).
+Completely different approach: use gradient magnitude distribution
+instead of Laplacian noise. Tests robustness of alternative features.
 
 Usage: python analyze.py
 """
@@ -18,27 +19,24 @@ from prepare import (
 # Feature extraction (MODIFY THIS)
 # ---------------------------------------------------------------------------
 
-def _minimal_features(img):
-    """1 feature: Laplacian noise level."""
+def _gradient_features(img):
+    """Gradient-based features: magnitude mean and std."""
     gray = img.mean(axis=2)
-
-    lap = np.zeros_like(gray)
-    lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
-                        gray[1:-1, :-2] + gray[1:-1, 2:] -
-                        4 * gray[1:-1, 1:-1])
-    noise = float(np.abs(lap).mean())
-
-    return [noise]
+    gx = gray[:, 1:] - gray[:, :-1]
+    gy = gray[1:, :] - gray[:-1, :]
+    h, w = min(gx.shape[0], gy.shape[0]), min(gx.shape[1], gy.shape[1])
+    mag = np.sqrt(gx[:h, :w] ** 2 + gy[:h, :w] ** 2)
+    return [float(mag.mean()), float(mag.std())]
 
 
 def extract_features(sample: dict) -> np.ndarray:
-    """Extract features from a single sample."""
+    """Extract gradient features from far and near images."""
     features = []
     far = load_image(sample["far"])
     near = load_image(sample["near"])
 
     for img in [far, near]:
-        features.extend(_minimal_features(img))
+        features.extend(_gradient_features(img))
 
     return np.array(features, dtype=np.float32)
 
