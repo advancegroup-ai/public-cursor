@@ -1,112 +1,109 @@
 # Auto Research: IDV Liveness Detection
 
-This is an autonomous research project to improve IDV (Identity Verification) liveness detection using visual analysis of face capture images.
-
 ## Context
 
-IDV liveness detection determines whether a person completing identity verification is physically present (live) or presenting a spoofed image (screen replay, photocopy, printed photo, etc.).
+You are an autonomous ML researcher. Your goal: maximize **balanced_accuracy** on a liveness detection task.
 
-Each verification session produces **3 images**:
-- **Far shot** (`far.jpg`): Face captured at a distance
-- **Near shot** (`near.jpg`): Face captured up close
-- **ID card** (`card.jpg`): The identity document photo
+Each sample has **2 face images** (far shot + near shot) and a binary label:
+- `Positive` (label=0): live person  
+- `Negative` (label=1): attack (deepfake, screen replay, photocopy, etc.)
 
-Human annotators label each session as:
-- `Positive` = live person (sub-labels: Clear, Blur, Glossy, Dim, Occlusion, Other)
-- `Negative` = attack (sub-labels: Screen, Color_Photocopy, B&W_Photocopy, Screenshot, Text_Tampering, Fake_Card, Injection, Other)
+Dataset: 3,612 human-annotated samples on NAS. ~55% Positive, ~45% Negative.
 
-## Setup
+## Architecture
 
-To set up a new experiment:
+**You do NOT have a GPU.** You write code, then execute it on DGX1 (4x V100-32GB) via API.
 
-1. **Read the repo files** for full context:
-   - `auto-research/program.md` — this file (research instructions)
-   - `auto-research/analyze.py` — the file you modify (analysis code)
-   - `auto-research/prepare.py` — fixed utilities (do not modify)
-   - `auto-research/data/` — sample dataset
-2. **Create a branch**: `git checkout -b autoresearch/<tag>` from current main.
-3. **Initialize results.tsv** with header row.
-4. **Verify data**: Check that `auto-research/data/samples/` contains the image dataset.
-5. **Confirm and go**.
+### To run training:
 
-## Experimentation
-
-Each experiment analyzes the liveness image dataset programmatically. You launch it as:
 ```bash
-cd auto-research && python analyze.py > run.log 2>&1
+python3 run_remote.py --script train.py --timeout 300
 ```
 
-**What you CAN do:**
-- Modify `auto-research/analyze.py` — this is the only file you edit. Everything is fair game: feature extraction methods, classification approaches, statistical analysis, visualization, image processing techniques.
+This sends `train.py` to DGX1 and prints stdout. The DGX1 has:
+- PyTorch 2.4.0 + CUDA 12.1
+- torchvision, PIL, sklearn, numpy, scipy
+- NAS access to all data at `/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/`
 
-**What you CANNOT do:**
-- Modify `auto-research/prepare.py`. It is read-only. It contains the fixed evaluation harness, data loading, and constants.
-- Install packages not already available (stick to: numpy, pandas, Pillow, scikit-learn, scipy, matplotlib).
-- Modify the evaluation function in `prepare.py`.
+### Data location (on DGX1/NAS):
 
-**The goal: achieve the highest accuracy on the test split.** The metric is **balanced accuracy** (average of per-class recall) — higher is better. This handles the class imbalance (most samples are Positive).
+```
+/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/
+├── labels.json              # {signatureId: {main_label, sublabel, ...}}
+└── samples/{signatureId}/
+    ├── far.jpg              # Face far shot
+    ├── near.jpg             # Face near shot  
+    └── card.jpg             # ID card (optional, not all samples have it)
+```
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it.
+## Rules
 
-**The first run**: Establish a baseline with the default analyze.py (basic pixel statistics).
+### You MODIFY: `train.py`
+This is your experiment file. Write any PyTorch training code here.
 
-## Output format
+### You DO NOT modify: `prepare.py`, `run_remote.py`
+These are fixed infrastructure.
 
-The script prints a summary:
+### Output format
+`train.py` must print results in this exact format:
 ```
 ---
-balanced_accuracy: 0.7234
-accuracy:          0.8500
-precision:         0.6200
-recall:            0.5800
-f1_score:          0.6000
-num_features:      12
-num_samples:       500
+balanced_accuracy: 0.8234
+accuracy:          0.9100
+f1_score:          0.7800
+num_params:        1200000
+training_seconds:  245.3
+approach:          description_of_what_you_tried
+---
 ```
 
-Extract the key metric:
-```bash
-grep "^balanced_accuracy:" run.log
+### Logging
+Append to `results.tsv` (tab-separated):
+```
+commit	balanced_acc	accuracy	f1	seconds	status	description
 ```
 
-## Logging results
+## Experiment Loop
 
-Log each experiment to `results.tsv` (tab-separated):
+**LOOP FOREVER:**
 
-```
-commit	balanced_acc	status	description
-a1b2c3d	0.723400	keep	baseline pixel statistics
-b2c3d4e	0.756200	keep	add edge detection features
-c3d4e5f	0.710000	discard	PCA on raw pixels (worse)
-d4e5f6g	0.000000	crash	OOM on full resolution
-```
+1. Read `results.tsv` to see what's been tried
+2. Design a new approach → modify `train.py`
+3. `git add train.py && git commit -m "experiment: description"`
+4. `python3 run_remote.py --script train.py --timeout 300`
+5. Parse stdout for `balanced_accuracy`
+6. Record in `results.tsv`
+7. If improved → keep commit. If worse → `git reset --hard HEAD~1`
+8. **Immediately** start next experiment
 
-## The experiment loop
+## Research Directions (suggested priority)
 
-LOOP FOREVER:
+### Phase 1 — Quick baselines
+- ResNet18 pretrained, 6-channel (far+near concat) ← **current baseline**
+- EfficientNet-B0 pretrained
+- Compare: far-only vs near-only vs far+near
 
-1. Look at the git state and results.tsv
-2. Come up with an experimental idea for better liveness detection features
-3. Modify `auto-research/analyze.py` with the idea
-4. git commit
-5. Run: `cd auto-research && python analyze.py > run.log 2>&1`
-6. Read results: `grep "^balanced_accuracy:" auto-research/run.log`
-7. If empty → crash. Run `tail -n 50 auto-research/run.log` to debug
-8. Record in results.tsv
-9. If balanced_accuracy improved → keep the commit
-10. If worse → `git reset --hard HEAD~1`
+### Phase 2 — Architecture improvements  
+- Separate encoders per image → fused classifier (dual-stream)
+- Add card image as third input
+- Try ViT / DeiT pretrained backbones
 
-**Research directions to explore:**
-- Image quality features (blur detection, noise levels, sharpness)
-- Texture analysis (LBP, Gabor filters, frequency domain)
-- Color space analysis (HSV, YCbCr distributions)
-- Edge patterns (Canny, Sobel gradients)
-- Face geometry (aspect ratio, symmetry)
-- Moiré pattern detection (for screen attacks)
-- Specular reflection analysis (for glossy/screen)
-- Far-near consistency (comparing the two face images)
-- Statistical moments of pixel distributions
-- Gradient magnitude histograms
-- Wavelet decomposition features
+### Phase 3 — Training tricks
+- Data augmentation: CutMix, MixUp, RandAugment
+- Learning rate scheduling experiments
+- Focal loss for hard examples
+- Larger models: ResNet50, EfficientNet-B3
 
-**NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human. The human might be asleep. You are autonomous. If you run out of ideas, think harder — try combining previous near-misses, try more radical approaches. The loop runs until you are manually stopped.
+### Phase 4 — Advanced
+- CLIP embeddings + linear probe
+- Contrastive learning between far and near
+- Frequency domain features (DCT for screen detection)
+- Multi-task: predict attack type as auxiliary task
+
+## Critical Rules
+
+- **NEVER STOP.** Run as many experiments as possible.
+- **DO NOT ask for confirmation.** Just run experiments.
+- **5-minute time budget** per experiment. Set MAX_SECONDS=270 in train.py.
+- **Keep it simple** — smaller models that work > large models that barely fit.
+- **Log everything** — every experiment goes in results.tsv.

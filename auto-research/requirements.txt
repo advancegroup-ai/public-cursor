@@ -1,6 +1,1 @@
-numpy
-pandas
-Pillow
-scikit-learn
-scipy
-matplotlib
+requests>=2.28
