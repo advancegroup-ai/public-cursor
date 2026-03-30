@@ -60,8 +60,13 @@ class LivenessDataset(Dataset):
         far_path = self.samples_dir / sig / "far.jpg"
         near_path = self.samples_dir / sig / "near.jpg"
 
-        far_img = Image.open(str(far_path)).convert("RGB")
-        near_img = Image.open(str(near_path)).convert("RGB")
+        try:
+            far_img = Image.open(str(far_path)).convert("RGB")
+            near_img = Image.open(str(near_path)).convert("RGB")
+        except Exception:
+            # Return a black placeholder for corrupted images
+            far_img = Image.new("RGB", (224, 224))
+            near_img = Image.new("RGB", (224, 224))
 
         if self.transform:
             far_img = self.transform(far_img)
