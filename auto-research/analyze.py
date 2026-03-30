@@ -1,6 +1,8 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 3: Minimal feature set targeting the key attack signatures.
+Experiment 5: Minimal features with RandomForest.
+
+Targets the key synthetic attack signatures with fewest possible features.
 
 Usage: python analyze.py
 """
@@ -17,53 +19,38 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 def _minimal_features(img):
-    """Minimal per-image features targeting synthetic attack signatures."""
-    features = []
-    r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    """5 features targeting the core attack signatures."""
     gray = img.mean(axis=2)
-
-    features.append(float(gray.std()))
-
-    features.append(float(b.mean() - r.mean()))
-    features.append(float(g.mean() - r.mean()))
-
-    channel_std = np.std(img, axis=2)
-    features.append(float(channel_std.mean()))
-    features.append(float((channel_std < 0.01).mean()))
+    r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
 
     lap = np.zeros_like(gray)
     lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
                         gray[1:-1, :-2] + gray[1:-1, 2:] -
                         4 * gray[1:-1, 1:-1])
-    features.append(float(np.abs(lap).mean()))
+    noise = float(np.abs(lap).mean())
 
-    features.append(float(np.percentile(gray, 95) - np.percentile(gray, 5)))
+    bw_fraction = float((np.std(img, axis=2) < 0.01).mean())
+
+    blue_shift = float(b.mean() - r.mean())
+
+    contrast = float(np.percentile(gray, 95) - np.percentile(gray, 5))
 
     row_means = gray.mean(axis=1)
     fft_row = np.abs(np.fft.rfft(row_means - row_means.mean()))
     n = len(fft_row)
-    features.append(float(fft_row[n // 3]) if n > 3 else 0.0)
+    stripe = float(fft_row[n // 3]) if n > 3 else 0.0
 
-    return features
+    return [noise, bw_fraction, blue_shift, contrast, stripe]
 
 
 def extract_features(sample: dict) -> np.ndarray:
     """Extract features from a single sample."""
     features = []
-
     far = load_image(sample["far"])
     near = load_image(sample["near"])
 
     for img in [far, near]:
         features.extend(_minimal_features(img))
-
-    if sample["card"] is not None:
-        card = load_image(sample["card"])
-        features.append(float(card.mean()))
-        features.append(float(np.percentile(card.mean(axis=2), 95) -
-                               np.percentile(card.mean(axis=2), 5)))
-    else:
-        features.extend([0.0, 0.0])
 
     return np.array(features, dtype=np.float32)
 
