@@ -1,60 +1,68 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 24: 2 Laplacian noise features + GradientBoosting (n=10).
+Best solution: 2 Laplacian noise features + DecisionTree.
 
-Testing gradient boosting as a different ensemble method.
+Simplest perfect solution found through 22 experiments:
+- Feature: mean absolute Laplacian (high-pass filter) per image
+- Only 2 features total (far noise, near noise)
+- Single DecisionTree classifier (no ensemble needed)
+- Achieves 1.0 balanced accuracy on test split
+
+Key findings from experimentation:
+- Laplacian noise is THE distinguishing signal (attacks have different texture)
+- Both far AND near images needed (1 alone gives 0.983)
+- Tree-based classifiers (DT, RF, GBM) all achieve 1.0
+- SVM also works; kNN, LogReg, and threshold do not
+- Alternative features (gradient mean, Haar wavelet energy) also achieve 1.0
+- Min tree depth for perfection is 3 (depth 2 gives 0.967)
 
 Usage: python analyze.py
 """
 
 import numpy as np
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.tree import DecisionTreeClassifier
 from prepare import (
     load_dataset, load_image, get_train_test_split,
     evaluate, print_results, print_detailed_report,
 )
 
 # ---------------------------------------------------------------------------
-# Feature extraction (MODIFY THIS)
+# Feature extraction
 # ---------------------------------------------------------------------------
 
 def _noise_feature(img):
-    """Laplacian noise level."""
+    """Laplacian noise level — mean absolute value of discrete Laplacian."""
     gray = img.mean(axis=2)
     lap = np.zeros_like(gray)
     lap[1:-1, 1:-1] = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
                         gray[1:-1, :-2] + gray[1:-1, 2:] -
                         4 * gray[1:-1, 1:-1])
-    return [float(np.abs(lap).mean())]
+    return float(np.abs(lap).mean())
 
 
 def extract_features(sample: dict) -> np.ndarray:
-    """Extract noise features from far and near images."""
-    features = []
+    """Extract Laplacian noise from far and near images (2 features)."""
     far = load_image(sample["far"])
     near = load_image(sample["near"])
-
-    for img in [far, near]:
-        features.extend(_noise_feature(img))
-
-    return np.array(features, dtype=np.float32)
+    return np.array([_noise_feature(far), _noise_feature(near)], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Classification (MODIFY THIS)
+# Classification
 # ---------------------------------------------------------------------------
 
 def build_classifier():
-    """Build and return a classifier."""
-    return GradientBoostingClassifier(
-        n_estimators=10,
-        max_depth=3,
+    """Single DecisionTree — simplest classifier that achieves 1.0."""
+    return DecisionTreeClassifier(
+        max_depth=None,
+        min_samples_leaf=2,
+        class_weight="balanced",
         random_state=42,
     )
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline (MODIFY THIS)
+# Main pipeline
 # ---------------------------------------------------------------------------
 
 def main():

@@ -23,3 +23,7 @@ bc82451	0.614286	discard	HSV saturation features + DecisionTree - color alone no
 a003f65	1.000000	keep	2 Haar wavelet energy features + DecisionTree - third alternate approach perfect
 f8bcfd9	0.950000	discard	2D FFT hf-ratio features + DecisionTree - not perfect
 67ffc23	1.000000	keep	2 noise features + GradientBoosting 10 trees - yet another perfect method
+3f452b7	0.983333	discard	LogReg + poly degree=3 noise features - 0.983 not perfect
+5c5eb4a	0.876190	discard	LBP variance features + DT - texture alone not enough
+a618b6a	0.838095	discard	far-near consistency features + DT - not enough
+c8ca6ed	0.966667	discard	AdaBoost 3 stumps + 2 noise - close but not perfect
