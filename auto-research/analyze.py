@@ -1,8 +1,8 @@
 """
 Liveness detection analysis — the file the agent modifies.
-Experiment 8: 2 features per image (4 total) + RF 50.
+Experiment 10: 1 feature per image (noise only, 2 total) + RF 50.
 
-Testing if noise + bw_fraction alone suffice.
+Testing if Laplacian noise alone suffices.
 
 Usage: python analyze.py
 """
@@ -19,7 +19,7 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 def _minimal_features(img):
-    """2 features targeting core attack signatures."""
+    """1 feature: Laplacian noise level."""
     gray = img.mean(axis=2)
 
     lap = np.zeros_like(gray)
@@ -28,9 +28,7 @@ def _minimal_features(img):
                         4 * gray[1:-1, 1:-1])
     noise = float(np.abs(lap).mean())
 
-    bw_fraction = float((np.std(img, axis=2) < 0.01).mean())
-
-    return [noise, bw_fraction]
+    return [noise]
 
 
 def extract_features(sample: dict) -> np.ndarray:
