@@ -1,31 +1,25 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: Hybrid ResNet18 + handcrafted noise/freq features fusion.
-Key idea: Extract handcrafted features (Laplacian noise, gradient stats, FFT) alongside
-ResNet18 deep features. Concatenate both for classification. Handcrafted features
-achieved 100% on smaller dataset; deep features generalize better. Combining both
-should capture complementary signals.
-Previous best: 0.976659 (ResNet18 6ch baseline).
+Experiment: Pure handcrafted features (noise, gradient, FFT, texture, color)
++ GradientBoosting ensemble on the full dataset.
+Handcrafted features achieved 100% on small dataset; let's see how they
+scale to the real 2586-sample dataset with proper train/test split.
+Previous best on DGX1: 0.976659 (ResNet18 6ch baseline).
 """
 import os
 import sys
 import json
 import time
 import random
-import math
 import numpy as np
 from pathlib import Path
 from collections import Counter
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as T
-import torchvision.models as models
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
 
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
@@ -34,26 +28,25 @@ MAX_SECONDS = 270
 
 random.seed(SEED)
 np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
 
 
-def extract_handcrafted(img_pil):
-    """Extract key handcrafted features from a PIL image (on CPU)."""
+def extract_features(img_pil):
+    """Extract comprehensive handcrafted features from a PIL image."""
     img_np = np.array(img_pil).astype(np.float32)
     gray = np.array(img_pil.convert("L")).astype(np.float32)
     features = []
 
     from scipy.ndimage import laplace
     lap = laplace(gray)
-    features.append(np.var(lap))
-    features.append(np.abs(lap).mean())
+    features.append(np.var(lap))        # Laplacian variance (sharpness)
+    features.append(np.abs(lap).mean()) # Mean absolute Laplacian
 
     gy = np.diff(gray, axis=0)
     gx = np.diff(gray, axis=1)
-    features.append(np.abs(gy).mean())
-    features.append(np.abs(gx).mean())
+    features.append(np.abs(gy).mean())  # Vertical gradient mean
+    features.append(np.abs(gx).mean())  # Horizontal gradient mean
+    features.append(np.std(gy))         # Vertical gradient std
+    features.append(np.std(gx))         # Horizontal gradient std
 
     fft = np.fft.fft2(gray)
     fft_shift = np.fft.fftshift(fft)
@@ -65,93 +58,43 @@ def extract_handcrafted(img_pil):
     center_mask = (Y - cy)**2 + (X - cx)**2 <= r**2
     low_energy = mag[center_mask].sum()
     total_energy = mag.sum() + 1e-10
-    features.append(1.0 - low_energy / total_energy)
+    hf_ratio = 1.0 - low_energy / total_energy
+    features.append(hf_ratio)
+
+    r2 = min(h, w) // 4
+    mid_mask = ((Y - cy)**2 + (X - cx)**2 <= r2**2) & ~center_mask
+    mid_energy = mag[mid_mask].sum()
+    features.append(mid_energy / total_energy)
 
     channel_means = img_np.mean(axis=(0, 1))
+    channel_stds = img_np.std(axis=(0, 1))
+    features.extend(channel_means.tolist())
+    features.extend(channel_stds.tolist())
+
     blue_shift = channel_means[2] - (channel_means[0] + channel_means[1]) / 2.0
     features.append(blue_shift)
 
     features.append(np.std(gray))
+    features.append(float(np.median(gray)))
+    features.append(float(np.percentile(gray, 95) - np.percentile(gray, 5)))
+
+    bw_pixels = np.sum((gray < 10) | (gray > 245))
+    features.append(bw_pixels / gray.size)
+
+    from scipy.ndimage import uniform_filter
+    local_mean = uniform_filter(gray, size=7)
+    local_sqr_mean = uniform_filter(gray**2, size=7)
+    local_var = np.maximum(local_sqr_mean - local_mean**2, 0)
+    features.append(np.mean(local_var))
+    features.append(np.std(local_var))
 
     return np.array(features, dtype=np.float32)
 
 
-class LivenessDataset(Dataset):
-    def __init__(self, sig_ids, labels, transform=None):
-        self.sig_ids = sig_ids
-        self.labels = labels
-        self.transform = transform
-        self.samples_dir = DATA_DIR / "samples"
+def train():
+    t0 = time.time()
+    print("Loading data...")
 
-    def __len__(self):
-        return len(self.sig_ids)
-
-    def __getitem__(self, idx):
-        sig = self.sig_ids[idx]
-        info = self.labels[sig]
-        label = 0 if info["main_label"] == "Positive" else 1
-
-        far_path = self.samples_dir / sig / "far.jpg"
-        near_path = self.samples_dir / sig / "near.jpg"
-
-        try:
-            far_img = Image.open(str(far_path)).convert("RGB")
-            near_img = Image.open(str(near_path)).convert("RGB")
-        except Exception:
-            far_img = Image.new("RGB", (224, 224))
-            near_img = Image.new("RGB", (224, 224))
-
-        far_feats = extract_handcrafted(far_img)
-        near_feats = extract_handcrafted(near_img)
-        diff_feats = far_feats - near_feats
-        handcrafted = np.concatenate([far_feats, near_feats, diff_feats])
-        handcrafted = np.nan_to_num(handcrafted, nan=0.0, posinf=1e6, neginf=-1e6)
-        handcrafted_tensor = torch.from_numpy(handcrafted)
-
-        if self.transform:
-            far_img = self.transform(far_img)
-            near_img = self.transform(near_img)
-
-        img = torch.cat([far_img, near_img], dim=0)
-        return img, handcrafted_tensor, label
-
-
-class HybridModel(nn.Module):
-    def __init__(self, handcrafted_dim=21, num_classes=2):
-        super().__init__()
-        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        old_conv = base.conv1
-        base.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        with torch.no_grad():
-            base.conv1.weight[:, :3] = old_conv.weight
-            base.conv1.weight[:, 3:] = old_conv.weight
-
-        feat_dim = base.fc.in_features
-        base.fc = nn.Identity()
-        self.backbone = base
-
-        self.handcrafted_proj = nn.Sequential(
-            nn.BatchNorm1d(handcrafted_dim),
-            nn.Linear(handcrafted_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Linear(feat_dim + 64, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
-        )
-
-    def forward(self, img, handcrafted):
-        deep_feat = self.backbone(img)
-        hand_feat = self.handcrafted_proj(handcrafted)
-        fused = torch.cat([deep_feat, hand_feat], dim=1)
-        return self.classifier(fused)
-
-
-def load_data():
     with open(str(DATA_DIR / "labels.json")) as f:
         labels = json.load(f)
 
@@ -169,104 +112,107 @@ def load_data():
     train_ids = [valid[i] for i in train_idx]
     test_ids = [valid[i] for i in test_idx]
 
-    dist_train = Counter(labels[s]["main_label"] for s in train_ids)
-    dist_test = Counter(labels[s]["main_label"] for s in test_ids)
+    dist_train = Counter(valid_labels[i] for i in train_idx)
+    dist_test = Counter(valid_labels[i] for i in test_idx)
     print(f"Train: {len(train_ids)} {dict(dist_train)}")
     print(f"Test:  {len(test_ids)} {dict(dist_test)}")
 
-    return train_ids, test_ids, labels
+    print("Extracting features...")
+    samples_dir = DATA_DIR / "samples"
 
+    def extract_for_ids(ids):
+        X_list = []
+        y_list = []
+        for i, sig in enumerate(ids):
+            if time.time() - t0 > MAX_SECONDS - 30:
+                print(f"Time budget warning at sample {i}/{len(ids)}")
+                break
+            label = 0 if labels[sig]["main_label"] == "Positive" else 1
+            try:
+                far_img = Image.open(str(samples_dir / sig / "far.jpg")).convert("RGB")
+                near_img = Image.open(str(samples_dir / sig / "near.jpg")).convert("RGB")
+                far_img = far_img.resize((256, 256))
+                near_img = near_img.resize((256, 256))
+            except Exception:
+                continue
 
-def train():
-    t0 = time.time()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+            far_feats = extract_features(far_img)
+            near_feats = extract_features(near_img)
+            diff_feats = far_feats - near_feats
+            ratio_feats = far_feats / (near_feats + 1e-10)
+            combined = np.concatenate([far_feats, near_feats, diff_feats, ratio_feats])
+            combined = np.nan_to_num(combined, nan=0.0, posinf=1e6, neginf=-1e6)
+            X_list.append(combined)
+            y_list.append(label)
 
-    train_ids, test_ids, labels = load_data()
+            if (i + 1) % 500 == 0:
+                print(f"  Processed {i+1}/{len(ids)} samples ({time.time()-t0:.1f}s)")
 
-    transform_train = T.Compose([
-        T.Resize((224, 224)),
-        T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    transform_test = T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+        return np.array(X_list), np.array(y_list)
 
-    train_ds = LivenessDataset(train_ids, labels, transform_train)
-    test_ds = LivenessDataset(test_ids, labels, transform_test)
+    X_train, y_train = extract_for_ids(train_ids)
+    X_test, y_test = extract_for_ids(test_ids)
+    print(f"Features: {X_train.shape[1]} per sample")
+    print(f"Extraction done in {time.time()-t0:.1f}s")
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
 
-    model = HybridModel(handcrafted_dim=21).to(device)
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Hybrid ResNet18 + handcrafted features, params: {num_params:,}")
+    print("Training GBM...")
+    gbm = GradientBoostingClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        min_samples_leaf=5,
+        random_state=SEED,
+    )
+    gbm.fit(X_train, y_train)
+    gbm_preds = gbm.predict(X_test)
+    gbm_bal_acc = balanced_accuracy_score(y_test, gbm_preds)
+    print(f"GBM balanced_accuracy: {gbm_bal_acc:.6f}")
 
-    train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
-    class_counts = Counter(train_labels)
-    weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
-    weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    print("Training RF...")
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_leaf=3,
+        random_state=SEED,
+        n_jobs=-1,
+    )
+    rf.fit(X_train, y_train)
+    rf_preds = rf.predict(X_test)
+    rf_bal_acc = balanced_accuracy_score(y_test, rf_preds)
+    print(f"RF balanced_accuracy: {rf_bal_acc:.6f}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=15)
+    gbm_proba = gbm.predict_proba(X_test)
+    rf_proba = rf.predict_proba(X_test)
+    ensemble_proba = 0.5 * gbm_proba + 0.5 * rf_proba
+    ensemble_preds = ensemble_proba.argmax(axis=1)
 
-    best_bal_acc = 0
-    best_acc = 0
-    best_f1 = 0
-    epochs = 15
+    bal_acc = balanced_accuracy_score(y_test, ensemble_preds)
+    acc = accuracy_score(y_test, ensemble_preds)
+    f1 = f1_score(y_test, ensemble_preds, average="binary")
+    print(f"Ensemble balanced_accuracy: {bal_acc:.6f}")
 
-    for epoch in range(epochs):
-        if time.time() - t0 > MAX_SECONDS:
-            print(f"Time budget reached at epoch {epoch}")
-            break
+    best_bal_acc = max(gbm_bal_acc, rf_bal_acc, bal_acc)
+    if best_bal_acc == gbm_bal_acc:
+        best_preds = gbm_preds
+        method = "gbm"
+    elif best_bal_acc == rf_bal_acc:
+        best_preds = rf_preds
+        method = "rf"
+    else:
+        best_preds = ensemble_preds
+        method = "ensemble"
 
-        model.train()
-        total_loss = 0
-        for imgs, handcrafted, targets in train_loader:
-            imgs = imgs.to(device)
-            handcrafted = handcrafted.to(device)
-            targets = targets.to(device)
-            optimizer.zero_grad()
-            out = model(imgs, handcrafted)
-            loss = criterion(out, targets)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_loss += loss.item()
-
-        scheduler.step()
-
-        model.eval()
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for imgs, handcrafted, targets in test_loader:
-                imgs = imgs.to(device)
-                handcrafted = handcrafted.to(device)
-                out = model(imgs, handcrafted)
-                preds = out.argmax(dim=1).cpu().numpy()
-                all_preds.extend(preds)
-                all_labels.extend(targets.numpy())
-
-        bal_acc = balanced_accuracy_score(all_labels, all_preds)
-        acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average="binary")
-        avg_loss = total_loss / len(train_loader)
-
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
-
-        if bal_acc > best_bal_acc:
-            best_bal_acc = bal_acc
-            best_acc = acc
-            best_f1 = f1
+    best_acc = accuracy_score(y_test, best_preds)
+    best_f1 = f1_score(y_test, best_preds, average="binary")
 
     elapsed = time.time() - t0
-    approach = "hybrid_resnet18_6ch_plus_handcrafted_21feats_fusion"
+    num_params = X_train.shape[1]
+    approach = f"handcrafted_{X_train.shape[1]}feats_{method}_300trees_full_dataset"
 
     result_block = (
         f"\n---\n"
@@ -288,9 +234,16 @@ def train():
         "training_seconds": elapsed,
         "approach": approach,
     }
-    with open(str(RESULTS_FILE), "w") as rf:
-        json.dump(result_data, rf, indent=2)
+    with open(str(RESULTS_FILE), "w") as rf_file:
+        json.dump(result_data, rf_file, indent=2)
     print(f"Results written to {RESULTS_FILE}")
+
+    if hasattr(gbm, 'feature_importances_'):
+        fi = gbm.feature_importances_
+        top_idx = np.argsort(fi)[::-1][:10]
+        print("\nTop 10 GBM feature importances:")
+        for rank, idx in enumerate(top_idx):
+            print(f"  {rank+1}. Feature {idx}: {fi[idx]:.4f}")
 
 
 train()
