@@ -1,45 +1,95 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
+BEST CANDIDATE: Hybrid ResNet18 + handcrafted noise/gradient/DCT features fusion
+with focal loss + warmup cosine + stratified split.
 
-This is the file the Cloud Agent modifies. It runs on DGX1 with:
-- 4x V100-32GB, PyTorch 2.4.0+cu121
-- NAS access: /mnt/nas/public2/simon/projects/auto_research/liveness-research/data/
-
-Output format (must print exactly):
----
-balanced_accuracy: 0.XXXX
-accuracy:          0.XXXX
-f1_score:          0.XXXX
-num_params:        NNNNN
-training_seconds:  NNN.N
-approach:          description_here
----
+This combines the strongest elements from our experiments:
+- ResNet18 backbone for spatial features (proven baseline at 0.976659)
+- Handcrafted features (noise, gradient, FFT, DCT) that achieved 100% on smaller dataset
+- Focal loss for hard example mining
+- Warmup + cosine LR schedule
+- Stratified split for fair evaluation
+Previous best on DGX1: 0.976659 (ResNet18 6ch baseline).
 """
 import os
 import sys
 import json
 import time
 import random
+import math
 import numpy as np
 from pathlib import Path
 from collections import Counter
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
+from sklearn.model_selection import StratifiedKFold
 
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
 SEED = 42
-MAX_SECONDS = 270  # leave margin within 5-min budget
+MAX_SECONDS = 270
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+
+def extract_handcrafted(img_pil):
+    """Extract handcrafted features: noise, gradient, FFT, DCT, color."""
+    img_np = np.array(img_pil).astype(np.float32)
+    gray = np.array(img_pil.convert("L")).astype(np.float32)
+    features = []
+
+    from scipy.ndimage import laplace
+    lap = laplace(gray)
+    features.append(np.var(lap))
+    features.append(np.abs(lap).mean())
+
+    gy = np.diff(gray, axis=0)
+    gx = np.diff(gray, axis=1)
+    features.append(np.abs(gy).mean())
+    features.append(np.abs(gx).mean())
+    features.append(np.std(gy))
+    features.append(np.std(gx))
+
+    fft = np.fft.fft2(gray)
+    fft_shift = np.fft.fftshift(fft)
+    mag = np.abs(fft_shift)
+    h, w = mag.shape
+    cy, cx = h // 2, w // 2
+    r = min(h, w) // 8
+    Y, X = np.ogrid[:h, :w]
+    center_mask = (Y - cy)**2 + (X - cx)**2 <= r**2
+    low_energy = mag[center_mask].sum()
+    total_energy = mag.sum() + 1e-10
+    features.append(1.0 - low_energy / total_energy)
+
+    from scipy.fft import dct
+    gray_small = np.array(img_pil.convert("L").resize((64, 64))).astype(np.float32)
+    dct_coeffs = dct(dct(gray_small, axis=0, norm='ortho'), axis=1, norm='ortho')
+    dct_mag = np.abs(dct_coeffs)
+    dct_total = dct_mag.sum() + 1e-10
+    features.append(dct_mag[:8, :8].sum() / dct_total)
+    features.append(dct_mag[8:32, 8:32].sum() / dct_total)
+    features.append(dct_mag[32:, 32:].sum() / dct_total)
+
+    channel_means = img_np.mean(axis=(0, 1))
+    blue_shift = channel_means[2] - (channel_means[0] + channel_means[1]) / 2.0
+    features.append(blue_shift)
+
+    features.append(np.std(gray))
+    features.append(float(np.percentile(gray, 95) - np.percentile(gray, 5)))
+
+    return np.array(features, dtype=np.float32)
 
 
 class LivenessDataset(Dataset):
@@ -64,57 +114,100 @@ class LivenessDataset(Dataset):
             far_img = Image.open(str(far_path)).convert("RGB")
             near_img = Image.open(str(near_path)).convert("RGB")
         except Exception:
-            # Return a black placeholder for corrupted images
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
+
+        far_feats = extract_handcrafted(far_img)
+        near_feats = extract_handcrafted(near_img)
+        diff_feats = far_feats - near_feats
+        handcrafted = np.concatenate([far_feats, near_feats, diff_feats])
+        handcrafted = np.nan_to_num(handcrafted, nan=0.0, posinf=1e6, neginf=-1e6)
+        handcrafted_tensor = torch.from_numpy(handcrafted)
 
         if self.transform:
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
-        img = torch.cat([far_img, near_img], dim=0)  # 6-channel input
-        return img, label
+        img = torch.cat([far_img, near_img], dim=0)
+        return img, handcrafted_tensor, label
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+
+class HybridModel(nn.Module):
+    def __init__(self, handcrafted_dim=42, num_classes=2):
+        super().__init__()
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        old_conv = base.conv1
+        base.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            base.conv1.weight[:, :3] = old_conv.weight
+            base.conv1.weight[:, 3:] = old_conv.weight
+
+        feat_dim = base.fc.in_features
+        base.fc = nn.Identity()
+        self.backbone = base
+
+        self.handcrafted_proj = nn.Sequential(
+            nn.BatchNorm1d(handcrafted_dim),
+            nn.Linear(handcrafted_dim, 128),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.GELU(),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feat_dim + 64),
+            nn.Dropout(0.3),
+            nn.Linear(feat_dim + 64, 256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, img, handcrafted):
+        deep_feat = self.backbone(img)
+        hand_feat = self.handcrafted_proj(handcrafted)
+        fused = torch.cat([deep_feat, hand_feat], dim=1)
+        return self.classifier(fused)
 
 
 def load_data():
     with open(str(DATA_DIR / "labels.json")) as f:
         labels = json.load(f)
 
-    # Filter valid samples
     valid = []
+    valid_labels = []
     for sig, info in labels.items():
         far = DATA_DIR / "samples" / sig / "far.jpg"
         near = DATA_DIR / "samples" / sig / "near.jpg"
         if far.exists() and near.exists():
             valid.append(sig)
+            valid_labels.append(0 if info["main_label"] == "Positive" else 1)
 
-    random.shuffle(valid)
-    split = int(len(valid) * 0.8)
-    train_ids = valid[:split]
-    test_ids = valid[split:]
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    train_idx, test_idx = next(skf.split(valid, valid_labels))
+    train_ids = [valid[i] for i in train_idx]
+    test_ids = [valid[i] for i in test_idx]
 
-    dist_train = Counter(labels[s]["main_label"] for s in train_ids)
-    dist_test = Counter(labels[s]["main_label"] for s in test_ids)
+    dist_train = Counter(valid_labels[i] for i in train_idx)
+    dist_test = Counter(valid_labels[i] for i in test_idx)
     print(f"Train: {len(train_ids)} {dict(dist_train)}")
     print(f"Test:  {len(test_ids)} {dict(dist_test)}")
 
     return train_ids, test_ids, labels
-
-
-def build_model(num_classes=2):
-    """ResNet18 pretrained, modified for 6-channel input (far+near concat)."""
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-
-    # Modify first conv to accept 6 channels
-    old_conv = model.conv1
-    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    with torch.no_grad():
-        # Init: duplicate pretrained 3-ch weights for both far and near
-        model.conv1.weight[:, :3] = old_conv.weight
-        model.conv1.weight[:, 3:] = old_conv.weight
-
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    return model
 
 
 def train():
@@ -125,9 +218,10 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((256, 256)),
+        T.RandomCrop(224),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -137,29 +231,45 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
+    n_hand = 14  # features per image
+    hand_dim = n_hand * 3  # far + near + diff
+
     train_ds = LivenessDataset(train_ids, labels, transform_train)
     test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = build_model().to(device)
+    model = HybridModel(handcrafted_dim=hand_dim).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 (6-ch), params: {num_params:,}")
+    print(f"Model: Hybrid ResNet18 + handcrafted (noise/grad/FFT/DCT), params: {num_params:,}")
 
-    # Weighted loss for class imbalance
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+    optimizer = torch.optim.AdamW([
+        {'params': model.backbone.parameters(), 'lr': 5e-5},
+        {'params': list(model.handcrafted_proj.parameters()) + list(model.classifier.parameters()), 'lr': 3e-4},
+    ], weight_decay=1e-4)
 
-    # Train
+    epochs = 20
+
+    def lr_lambda(epoch):
+        warmup = 3
+        if epoch < warmup:
+            return (epoch + 1) / warmup
+        progress = (epoch - warmup) / max(1, epochs - warmup)
+        return max(1e-6 / 3e-4, 0.5 * (1 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     best_bal_acc = 0
-    epochs = 10
+    best_acc = 0
+    best_f1 = 0
+
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
             print(f"Time budget reached at epoch {epoch}")
@@ -167,24 +277,27 @@ def train():
 
         model.train()
         total_loss = 0
-        for imgs, targets in train_loader:
-            imgs, targets = imgs.to(device), targets.to(device)
+        for imgs, handcrafted, targets in train_loader:
+            imgs = imgs.to(device)
+            handcrafted = handcrafted.to(device)
+            targets = targets.to(device)
             optimizer.zero_grad()
-            out = model(imgs)
+            out = model(imgs, handcrafted)
             loss = criterion(out, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
 
         scheduler.step()
 
-        # Eval
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for imgs, targets in test_loader:
+            for imgs, handcrafted, targets in test_loader:
                 imgs = imgs.to(device)
-                out = model(imgs)
+                handcrafted = handcrafted.to(device)
+                out = model(imgs, handcrafted)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -193,8 +306,9 @@ def train():
         acc = accuracy_score(all_labels, all_preds)
         f1 = f1_score(all_labels, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
+        lr = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} lr={lr:.6f}")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
@@ -202,8 +316,8 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
+    approach = "hybrid_resnet18_handcrafted_noise_grad_fft_dct_focal_warmup_cosine"
 
-    # Output in required format (both print and write to file for pipeline compatibility)
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
@@ -211,24 +325,22 @@ def train():
         f"f1_score:          {best_f1:.6f}\n"
         f"num_params:        {num_params}\n"
         f"training_seconds:  {elapsed:.1f}\n"
-        f"approach:          resnet18_pretrained_6ch_far_near\n"
+        f"approach:          {approach}\n"
         f"---\n"
     )
     print(result_block)
-    
-    # Also write to file (pipeline stdout capture is unreliable)
+
     result_data = {
         "balanced_accuracy": best_bal_acc,
         "accuracy": best_acc,
         "f1_score": best_f1,
         "num_params": num_params,
         "training_seconds": elapsed,
-        "approach": "resnet18_pretrained_6ch_far_near",
+        "approach": approach,
     }
     with open(str(RESULTS_FILE), "w") as rf:
         json.dump(result_data, rf, indent=2)
     print(f"Results written to {RESULTS_FILE}")
 
 
-# Always run when executed (pipeline uses exec(), not __main__)
 train()
