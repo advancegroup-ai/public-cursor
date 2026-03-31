@@ -33,3 +33,4 @@ ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders
 --- iter12 experiments ---
 9de2fd6	0.970208	discard	[DGX1] EfficientNet-B0 6ch + focal loss + OneCycleLR + strong aug (9 epochs, 252.5s)
 --- iter22 experiments ---
+ab45ba4	N/A	blocked	[DGX1] ResNet18 6ch + focal loss + MixUp + OneCycleLR + strong aug - VT_TOKEN missing
