@@ -1,15 +1,17 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
 
-Experiment: ResNet50 6ch + gradient accumulation + cosine warmup + dropout 0.5.
-Larger backbone for more capacity. Gradient accumulation enables effective batch
-size of 64 while keeping memory usage low.
+Experiment: ResNet18 6ch + frequency-aware head with DCT pooling.
+Adds frequency domain features via learnable DCT-like pooling on intermediate
+feature maps. Screen replays and prints often show frequency artifacts that
+are invisible in spatial domain but clear in frequency space.
 """
 import os
 import sys
 import json
 import time
 import random
+import math
 import numpy as np
 from pathlib import Path
 from collections import Counter
@@ -91,6 +93,70 @@ class LivenessDataset(Dataset):
         return img, label
 
 
+class FrequencyPool(nn.Module):
+    """Pool feature maps in frequency domain to capture periodic artifacts."""
+    def __init__(self, in_channels, pool_size=7):
+        super().__init__()
+        self.pool_size = pool_size
+        self.weight = nn.Parameter(torch.randn(in_channels, pool_size, pool_size) * 0.02)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_fft = torch.fft.rfft2(x, norm='ortho')
+        magnitude = torch.abs(x_fft)
+        phase_info = torch.angle(x_fft)
+
+        mag_pool = F.adaptive_avg_pool2d(magnitude, (self.pool_size, self.pool_size // 2 + 1))
+        weighted = mag_pool * self.weight[:, :, :self.pool_size // 2 + 1].unsqueeze(0)
+        return weighted.flatten(1)
+
+
+class FreqAwareResNet(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+        old_conv = backbone.conv1
+        backbone.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            backbone.conv1.weight[:, :3] = old_conv.weight
+            backbone.conv1.weight[:, 3:] = old_conv.weight
+
+        layers = list(backbone.children())
+        self.early = nn.Sequential(*layers[:5])   # up to layer1
+        self.mid = nn.Sequential(*layers[5:7])     # layer2 + layer3
+        self.late = nn.Sequential(*layers[7:8])    # layer4
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        self.freq_early = FrequencyPool(64, pool_size=7)
+        self.freq_mid = FrequencyPool(256, pool_size=5)
+
+        spatial_dim = 512
+        freq_early_dim = 64 * 7 * 4  # rfft output width
+        freq_mid_dim = 256 * 5 * 3
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(spatial_dim + freq_early_dim + freq_mid_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        early = self.early(x)
+        freq_e = self.freq_early(early)
+
+        mid = self.mid(early)
+        freq_m = self.freq_mid(mid)
+
+        late = self.late(mid)
+        spatial = self.global_pool(late).flatten(1)
+
+        combined = torch.cat([spatial, freq_e, freq_m], dim=1)
+        return self.classifier(combined)
+
+
 def load_data():
     labels = load_labels()
     samples_dir = DATA_DIR / "samples"
@@ -119,24 +185,6 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-def build_resnet50_6ch(num_classes=2):
-    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-    old_conv = model.conv1
-    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    with torch.no_grad():
-        model.conv1.weight[:, :3] = old_conv.weight
-        model.conv1.weight[:, 3:] = old_conv.weight
-
-    model.fc = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(model.fc.in_features, 256),
-        nn.ReLU(),
-        nn.Dropout(0.3),
-        nn.Linear(256, num_classes),
-    )
-    return model
-
-
 def train():
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -149,12 +197,9 @@ def train():
     transform_train = T.Compose([
         T.Resize((224, 224)),
         T.RandomHorizontalFlip(),
-        T.RandomRotation(10),
-        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
-        T.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        T.ColorJitter(brightness=0.2, contrast=0.2),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        T.RandomErasing(p=0.15, scale=(0.02, 0.1)),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -165,39 +210,28 @@ def train():
     train_ds = LivenessDataset(train_ids, labels, transform_train)
     test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = build_resnet50_6ch().to(device)
+    model = FreqAwareResNet(num_classes=2).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet50 (6ch) + grad accum, params: {num_params:,}")
+    print(f"Model: FreqAware ResNet18 (6ch + freq pooling), params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
-    epochs = 12
-    warmup_epochs = 2
-    total_steps = epochs * len(train_loader)
-    warmup_steps = warmup_epochs * len(train_loader)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    epochs = 15
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=3e-4, epochs=epochs, steps_per_epoch=len(train_loader)
+    )
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        progress = (step - warmup_steps) / (total_steps - warmup_steps)
-        return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    accum_steps = 4
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
-    global_step = 0
-
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
             print(f"Time budget reached at epoch {epoch}")
@@ -205,21 +239,16 @@ def train():
 
         model.train()
         total_loss = 0
-        optimizer.zero_grad()
-
-        for batch_idx, (imgs, targets) in enumerate(train_loader):
+        for imgs, targets in train_loader:
             imgs, targets = imgs.to(device), targets.to(device)
+            optimizer.zero_grad()
             out = model(imgs)
-            loss = criterion(out, targets) / accum_steps
+            loss = criterion(out, targets)
             loss.backward()
-            total_loss += loss.item() * accum_steps
-
-            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
 
         model.eval()
         all_preds, all_labels = [], []
@@ -244,7 +273,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "resnet50_6ch_grad_accum4_cosine_warmup_label_smooth_0.1"
+    approach = "freq_aware_resnet18_6ch_learnable_fft_pooling_multi_scale"
 
     print(f"\n---")
     print(f"balanced_accuracy: {best_bal_acc:.6f}")
