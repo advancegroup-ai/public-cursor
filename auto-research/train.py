@@ -1,8 +1,7 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: ConvNeXt-Tiny pretrained, 6-channel (far+near), with strong
-regularization (Stochastic Depth + CutMix + label smoothing).
-ConvNeXt is a modern CNN that matches ViT performance while being simpler.
+Experiment: EfficientNet-B0 pretrained, 6-channel (far+near), focal loss,
+stratified k-fold, cosine LR with warmup, strong augmentation.
 """
 import os
 import sys
@@ -21,9 +20,10 @@ import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
+from sklearn.model_selection import StratifiedKFold
 
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
-RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
+RESULTS_FILE = DATA_DIR / "last_result.json"
 SEED = 42
 MAX_SECONDS = 270
 
@@ -32,6 +32,35 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
+
+
+def load_labels():
+    labels = {}
+    for fname, default_label in [("neg_batch.json", "Negative"), ("pos_batch.json", "Positive")]:
+        with open(str(DATA_DIR / fname)) as f:
+            batch = json.load(f)
+        for d in batch.get("data", []):
+            parts = d["sample_id"].split("_")
+            if len(parts) >= 4:
+                sig = parts[3]
+                main_label = d["pn"].split("/")[0]
+                if main_label in ("Negative Type", "Negative_Type"):
+                    main_label = "Negative"
+                labels[sig] = {"main_label": main_label, "pn": d["pn"]}
+    return labels
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
 
 
 class LivenessDataset(Dataset):
@@ -67,44 +96,25 @@ class LivenessDataset(Dataset):
         return img, label
 
 
-def cutmix_data(x, y, alpha=1.0):
-    """CutMix augmentation."""
-    lam = np.random.beta(alpha, alpha)
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
-
-    _, _, h, w = x.shape
-    cut_rat = np.sqrt(1.0 - lam)
-    cut_w = int(w * cut_rat)
-    cut_h = int(h * cut_rat)
-    cx = np.random.randint(w)
-    cy = np.random.randint(h)
-    x1 = np.clip(cx - cut_w // 2, 0, w)
-    y1 = np.clip(cy - cut_h // 2, 0, h)
-    x2 = np.clip(cx + cut_w // 2, 0, w)
-    y2 = np.clip(cy + cut_h // 2, 0, h)
-
-    x_mixed = x.clone()
-    x_mixed[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
-    lam = 1 - ((x2 - x1) * (y2 - y1)) / (w * h)
-    return x_mixed, y[index], lam
-
-
 def load_data():
-    with open(str(DATA_DIR / "labels.json")) as f:
-        labels = json.load(f)
+    labels = load_labels()
+    samples_dir = DATA_DIR / "samples"
+    all_sigs = set(os.listdir(str(samples_dir)))
 
-    valid = []
-    for sig, info in labels.items():
-        far = DATA_DIR / "samples" / sig / "far.jpg"
-        near = DATA_DIR / "samples" / sig / "near.jpg"
-        if far.exists() and near.exists():
-            valid.append(sig)
+    valid_sigs = [s for s in labels if s in all_sigs
+                  and (samples_dir / s / "far.jpg").exists()
+                  and (samples_dir / s / "near.jpg").exists()]
 
-    random.shuffle(valid)
-    split = int(len(valid) * 0.8)
-    train_ids = valid[:split]
-    test_ids = valid[split:]
+    binary_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in valid_sigs]
+    print(f"Total valid samples: {len(valid_sigs)}")
+    print(f"Distribution: {Counter(binary_labels)}")
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(valid_sigs, binary_labels)):
+        if fold_idx == 0:
+            train_ids = [valid_sigs[i] for i in train_idx]
+            test_ids = [valid_sigs[i] for i in test_idx]
+            break
 
     dist_train = Counter(labels[s]["main_label"] for s in train_ids)
     dist_test = Counter(labels[s]["main_label"] for s in test_ids)
@@ -115,15 +125,15 @@ def load_data():
 
 
 def build_model(num_classes=2):
-    """ConvNeXt-Tiny pretrained, modified for 6-channel input."""
-    model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+    """EfficientNet-B0 pretrained, modified for 6-channel input."""
+    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
 
     old_conv = model.features[0][0]
     new_conv = nn.Conv2d(6, old_conv.out_channels,
                          kernel_size=old_conv.kernel_size,
                          stride=old_conv.stride,
                          padding=old_conv.padding,
-                         bias=old_conv.bias is not None)
+                         bias=(old_conv.bias is not None))
     with torch.no_grad():
         new_conv.weight[:, :3] = old_conv.weight
         new_conv.weight[:, 3:] = old_conv.weight
@@ -131,8 +141,11 @@ def build_model(num_classes=2):
             new_conv.bias.copy_(old_conv.bias)
     model.features[0][0] = new_conv
 
-    in_features = model.classifier[2].in_features
-    model.classifier[2] = nn.Linear(in_features, num_classes)
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(p=0.3),
+        nn.Linear(in_features, num_classes)
+    )
     return model
 
 
@@ -162,29 +175,31 @@ def train():
     train_ds = LivenessDataset(train_ids, labels, transform_train)
     test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True,
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True,
                               num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False,
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False,
                              num_workers=4, pin_memory=True)
 
     model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ConvNeXt-Tiny (6-ch), params: {num_params:,}")
+    print(f"Model: EfficientNet-B0 (6-ch), params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
+    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-2)
-    epochs = 12
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-2)
+    epochs = 15
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=2e-4, steps_per_epoch=len(train_loader),
+        epochs=epochs, pct_start=0.1
+    )
 
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
-    use_cutmix = True
 
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS - 30:
@@ -195,23 +210,14 @@ def train():
         total_loss = 0
         for imgs, targets in train_loader:
             imgs, targets = imgs.to(device), targets.to(device)
-
-            if use_cutmix and random.random() > 0.5:
-                imgs_mixed, targets_shuffled, lam = cutmix_data(imgs, targets, alpha=1.0)
-                optimizer.zero_grad()
-                out = model(imgs_mixed)
-                loss = lam * criterion(out, targets) + (1 - lam) * criterion(out, targets_shuffled)
-            else:
-                optimizer.zero_grad()
-                out = model(imgs)
-                loss = criterion(out, targets)
-
+            optimizer.zero_grad()
+            out = model(imgs)
+            loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             total_loss += loss.item()
-
-        scheduler.step()
 
         model.eval()
         all_preds, all_labels = [], []
@@ -237,7 +243,7 @@ def train():
 
     elapsed = time.time() - t0
 
-    approach = "convnext_tiny_6ch_cutmix_label_smooth_strong_aug"
+    approach = "efficientnet_b0_6ch_focal_loss_onecycle_strong_aug"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
