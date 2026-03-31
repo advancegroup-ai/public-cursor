@@ -1,8 +1,8 @@
 """
-train.py — Liveness: EfficientNet-B0 + focal loss, local-cached images for speed.
-Copies sampled data to /tmp then trains from local SSD.
+train.py — Liveness: EfficientNet-B0 + focal loss, fast data loading via pre-filtered IDs.
+Uses disk_ids set to avoid slow file existence checks.
 """
-import os, sys, json, time, random, math, shutil
+import os, sys, json, time, random, math
 import numpy as np
 from pathlib import Path
 from collections import Counter
@@ -17,10 +17,9 @@ from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 
 NAS_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
-LOCAL_DIR = Path("/tmp/liveness_data")
 RESULTS_FILE = NAS_DIR / "last_result.json"
 SEED = 42
-MAX_SECONDS = 200
+MAX_SECONDS = 210
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -73,9 +72,13 @@ class LivenessDataset(Dataset):
         return img, label
 
 
-def load_and_cache_data():
-    """Load labels from jsonl, sample balanced subset, copy to local SSD."""
+def load_data():
+    """Fast: list disk dirs once, cross-ref with annotations_full.jsonl."""
     t0 = time.time()
+
+    samples_dir = NAS_DIR / "samples"
+    disk_ids = set(os.listdir(str(samples_dir)))
+    print(f"Disk dirs: {len(disk_ids)} ({time.time()-t0:.1f}s)")
 
     label_map = {}
     positives = []
@@ -86,58 +89,36 @@ def load_and_cache_data():
             rec = json.loads(line)
             sig = rec["sig"]
             lbl = rec.get("label", "")
-            if lbl == "Positive":
-                positives.append(sig)
-                label_map[sig] = 0
-            elif lbl == "Negative":
-                negatives.append(sig)
-                label_map[sig] = 1
+            if sig in disk_ids:
+                if lbl == "Positive":
+                    positives.append(sig)
+                    label_map[sig] = 0
+                elif lbl == "Negative":
+                    negatives.append(sig)
+                    label_map[sig] = 1
 
-    print(f"Labels: {len(positives)} pos, {len(negatives)} neg ({time.time()-t0:.1f}s)")
+    print(f"On-disk labeled: {len(positives)} pos, {len(negatives)} neg ({time.time()-t0:.1f}s)")
 
     random.shuffle(positives)
     random.shuffle(negatives)
 
-    MAX_PER_CLASS = 1500
+    MAX_PER_CLASS = 2000
     positives = positives[:MAX_PER_CLASS]
     negatives = negatives[:MAX_PER_CLASS]
 
     all_ids = positives + negatives
     random.shuffle(all_ids)
 
-    local_samples = LOCAL_DIR / "samples"
-    local_samples.mkdir(parents=True, exist_ok=True)
-
-    print(f"Copying {len(all_ids)} samples to local SSD...")
-    copied = 0
-    failed = 0
-    for sig in all_ids:
-        src = NAS_DIR / "samples" / sig
-        dst = local_samples / sig
-        if dst.exists():
-            copied += 1
-            continue
-        try:
-            shutil.copytree(str(src), str(dst))
-            copied += 1
-        except Exception:
-            failed += 1
-
-    print(f"Copied: {copied}, failed: {failed} ({time.time()-t0:.1f}s)")
-
-    valid_ids = [s for s in all_ids if (local_samples / s / "far.jpg").exists() and (local_samples / s / "near.jpg").exists()]
-    print(f"Valid after copy: {len(valid_ids)}")
-
-    split = int(len(valid_ids) * 0.8)
-    train_ids = valid_ids[:split]
-    test_ids = valid_ids[split:]
+    split = int(len(all_ids) * 0.8)
+    train_ids = all_ids[:split]
+    test_ids = all_ids[split:]
 
     dist_train = Counter(label_map[s] for s in train_ids)
     dist_test = Counter(label_map[s] for s in test_ids)
-    print(f"Train: {len(train_ids)} ({dict(dist_train)})")
-    print(f"Test:  {len(test_ids)} ({dict(dist_test)})")
+    print(f"Train: {len(train_ids)} {dict(dist_train)}")
+    print(f"Test:  {len(test_ids)} {dict(dist_test)}")
 
-    return train_ids, test_ids, label_map, local_samples
+    return train_ids, test_ids, label_map, samples_dir
 
 
 def build_model(num_classes=2):
@@ -168,8 +149,8 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    train_ids, test_ids, label_map, samples_dir = load_and_cache_data()
-    print(f"Data ready: {time.time()-t0:.1f}s")
+    train_ids, test_ids, label_map, samples_dir = load_data()
+    print(f"Data loading: {time.time()-t0:.1f}s")
 
     transform_train = T.Compose([
         T.Resize((240, 240)),
@@ -190,8 +171,8 @@ def train():
     train_ds = LivenessDataset(train_ids, label_map, samples_dir, transform_train)
     test_ds = LivenessDataset(test_ids, label_map, samples_dir, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=4)
+    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=4, pin_memory=True)
 
     model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -262,7 +243,7 @@ def train():
 
     elapsed = time.time() - t0
 
-    approach = "efficientnet_b0_6ch_focal_balanced1500_local_cache_cosine_warmup"
+    approach = "efficientnet_b0_6ch_focal_balanced2k_nas_direct_cosine_warmup"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
