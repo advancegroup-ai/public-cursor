@@ -30,14 +30,23 @@ c8ca6ed	0.966667	discard	AdaBoost 3 stumps + 2 noise - close but not perfect
 --- iter2 DGX1 deep learning experiments (real 2586-sample dataset) ---
 6dc40d3	0.976659	keep	[DGX1] ResNet18 pretrained 6ch (far+near) baseline, Adam lr=1e-4, 15 epochs
 ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders) + OneCycleLR - worse than single stream
+--- iter12 experiments ---
+9de2fd6	0.970208	discard	[DGX1] EfficientNet-B0 6ch + focal loss + OneCycleLR + strong aug (9 epochs, 252.5s)
 --- iter13 experiments (VT_TOKEN missing - could not execute on DGX1) ---
 ad837f7	N/A	blocked	[DGX1] EfficientNet-B0 6ch + focal loss + RandAugment + cosine warmup LR
 ae8811a	N/A	blocked	[DGX1] ResNet18 6ch + MixUp + label smoothing + heavy augment + cosine warmup
 3e497f9	N/A	blocked	[DGX1] Hybrid ResNet18 + handcrafted noise/freq features fused classifier
 48a6bfe	N/A	blocked	[DGX1] Dual ViT-B/16 shared encoder + cross-attention fusion + focal loss
 30a56fa	N/A	blocked	[DGX1] ResNet50 6ch + heavy augment + cosine warm restarts + label smoothing
---- iter14 experiments (using annotations_full.jsonl, balanced sampling) ---
+--- iter13-14 experiments (using annotations_full.jsonl, balanced sampling) ---
 03b99e0	0.932550	keep	[DGX1] EfficientNet-B0 6ch + focal loss + heavy augment + cosine warmup (1500/class)
 d159e75	0.859989	discard	[DGX1] ResNet18 6ch + MixUp + label smoothing + OneCycleLR (only 3 epochs)
 20f53d3	0.774645	discard	[DGX1] Hybrid ResNet18 + noise/gradient handcrafted features (5 epochs)
 ac52b91	0.794012	discard	[DGX1] EfficientNet-B0 6ch 160px focal strong augment (800/class too small)
+--- iter14 experiments (using neg/pos_batch.json labels, 2586 samples) ---
+N/A	0.946867	discard	[DGX1] EfficientNet-B0 6ch + focal loss + strong aug + TTA (only 6 epochs, too slow)
+N/A	0.960530	discard	[DGX1] ResNet18 6ch + MixUp + label smooth + OneCycleLR + TTA + dropout head (over-regularized)
+548e9eb	0.985515	keep	[DGX1] Dual-stream ResNet18 shared encoder 3ch RGB + cosine LR + TTA - NEW BEST
+N/A	0.975837	discard	[DGX1] Dual-stream ResNet18 + cross-attention + frozen early layers + TTA
+N/A	0.979063	discard	[DGX1] Dual-stream ResNet18 + diff feature + BN head + warm restarts + TTA
+N/A	N/A	blocked	[DGX1] Dual-stream ResNet34 + SWA + TTA - token expired before execution
