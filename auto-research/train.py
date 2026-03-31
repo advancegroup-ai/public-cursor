@@ -1,9 +1,9 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
 
-Experiment: Hybrid ResNet18 deep features + handcrafted noise/gradient/FFT features.
-Combines the strong deep learning baseline with the Laplacian noise features
-that achieved perfect classification on the smaller dataset.
+Experiment: EfficientNet-B0 6-channel pretrained with AdamW + OneCycleLR + strong aug.
+Different backbone than ResNet18 baseline. EfficientNet-B0 is more parameter-efficient
+and may generalize better with fewer samples.
 """
 import os
 import sys
@@ -52,61 +52,18 @@ def load_labels():
                 if main_label in ("Negative Type", "Negative_Type"):
                     main_label = "Negative"
                 labels[sig] = {"main_label": main_label, "pn": d["pn"]}
-
     if not labels:
         with open(str(DATA_DIR / "labels.json")) as f:
             labels = json.load(f)
-
     return labels
 
 
-def compute_handcrafted_features(img_path):
-    """Compute noise/gradient/FFT features from a single image."""
-    try:
-        img = Image.open(str(img_path)).convert("L")
-        arr = np.array(img, dtype=np.float32)
-
-        laplacian = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32)
-        from scipy.signal import convolve2d
-        lap = convolve2d(arr, laplacian, mode='valid')
-        noise_std = float(np.std(lap))
-
-        gy, gx = np.gradient(arr)
-        grad_mag = np.sqrt(gx**2 + gy**2)
-        grad_mean = float(np.mean(grad_mag))
-
-        fft = np.fft.fft2(arr)
-        fft_shift = np.fft.fftshift(fft)
-        magnitude = np.log1p(np.abs(fft_shift))
-        h, w = magnitude.shape
-        ch, cw = h // 2, w // 2
-        r = min(h, w) // 8
-        low_freq = magnitude[ch-r:ch+r, cw-r:cw+r].mean()
-        high_freq = magnitude.mean()
-        hf_ratio = float(high_freq / (low_freq + 1e-8))
-
-        return [noise_std, grad_mean, hf_ratio]
-    except Exception:
-        return [0.0, 0.0, 0.0]
-
-
-class HybridLivenessDataset(Dataset):
-    def __init__(self, sig_ids, labels, transform=None, cache_features=True):
+class LivenessDataset(Dataset):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
         self.transform = transform
         self.samples_dir = DATA_DIR / "samples"
-        self.feature_cache = {}
-
-        if cache_features:
-            for i, sig in enumerate(sig_ids):
-                far_path = self.samples_dir / sig / "far.jpg"
-                near_path = self.samples_dir / sig / "near.jpg"
-                far_feats = compute_handcrafted_features(far_path)
-                near_feats = compute_handcrafted_features(near_path)
-                self.feature_cache[sig] = far_feats + near_feats
-                if (i + 1) % 500 == 0:
-                    print(f"  Cached features: {i+1}/{len(sig_ids)}")
 
     def __len__(self):
         return len(self.sig_ids)
@@ -131,52 +88,7 @@ class HybridLivenessDataset(Dataset):
             near_img = self.transform(near_img)
 
         img = torch.cat([far_img, near_img], dim=0)
-
-        if sig in self.feature_cache:
-            feats = torch.tensor(self.feature_cache[sig], dtype=torch.float32)
-        else:
-            far_feats = compute_handcrafted_features(far_path)
-            near_feats = compute_handcrafted_features(near_path)
-            feats = torch.tensor(far_feats + near_feats, dtype=torch.float32)
-
-        return img, feats, label
-
-
-class HybridModel(nn.Module):
-    def __init__(self, num_handcrafted=6, num_classes=2):
-        super().__init__()
-        backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-
-        old_conv = backbone.conv1
-        backbone.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        with torch.no_grad():
-            backbone.conv1.weight[:, :3] = old_conv.weight
-            backbone.conv1.weight[:, 3:] = old_conv.weight
-
-        self.features = nn.Sequential(*list(backbone.children())[:-1])
-        deep_dim = 512
-
-        self.handcrafted_net = nn.Sequential(
-            nn.Linear(num_handcrafted, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, 32),
-            nn.ReLU(),
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(deep_dim + 32, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, img, handcrafted):
-        deep = self.features(img).flatten(1)
-        hc = self.handcrafted_net(handcrafted)
-        combined = torch.cat([deep, hc], dim=1)
-        return self.classifier(combined)
+        return img, label
 
 
 def load_data():
@@ -207,6 +119,24 @@ def load_data():
     return train_ids, test_ids, labels
 
 
+def build_efficientnet_6ch(num_classes=2):
+    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+
+    old_conv = model.features[0][0]
+    new_conv = nn.Conv2d(6, 32, kernel_size=3, stride=2, padding=1, bias=False)
+    with torch.no_grad():
+        new_conv.weight[:, :3] = old_conv.weight
+        new_conv.weight[:, 3:] = old_conv.weight
+    model.features[0][0] = new_conv
+
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(in_features, num_classes),
+    )
+    return model
+
+
 def train():
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -219,10 +149,12 @@ def train():
     transform_train = T.Compose([
         T.Resize((224, 224)),
         T.RandomHorizontalFlip(),
-        T.RandomRotation(10),
+        T.RandomRotation(15),
         T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+        T.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        T.RandomErasing(p=0.2),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -230,17 +162,15 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    print("Caching handcrafted features for train set...")
-    train_ds = HybridLivenessDataset(train_ids, labels, transform_train)
-    print("Caching handcrafted features for test set...")
-    test_ds = HybridLivenessDataset(test_ids, labels, transform_test)
+    train_ds = LivenessDataset(train_ids, labels, transform_train)
+    test_ds = LivenessDataset(test_ids, labels, transform_test)
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = HybridModel(num_handcrafted=6, num_classes=2).to(device)
+    model = build_efficientnet_6ch().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: HybridResNet18 (6ch deep + 6 handcrafted), params: {num_params:,}")
+    print(f"Model: EfficientNet-B0 (6ch), params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
@@ -249,14 +179,14 @@ def train():
     criterion = nn.CrossEntropyLoss(weight=weight.to(device))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    epochs = 15
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=3e-4, epochs=15, steps_per_epoch=len(train_loader)
+        optimizer, max_lr=5e-4, epochs=epochs, steps_per_epoch=len(train_loader)
     )
 
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
-    epochs = 15
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
             print(f"Time budget reached at epoch {epoch}")
@@ -264,12 +194,10 @@ def train():
 
         model.train()
         total_loss = 0
-        for imgs, feats, targets in train_loader:
-            imgs = imgs.to(device)
-            feats = feats.to(device)
-            targets = targets.to(device)
+        for imgs, targets in train_loader:
+            imgs, targets = imgs.to(device), targets.to(device)
             optimizer.zero_grad()
-            out = model(imgs, feats)
+            out = model(imgs)
             loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -280,10 +208,9 @@ def train():
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for imgs, feats, targets in test_loader:
+            for imgs, targets in test_loader:
                 imgs = imgs.to(device)
-                feats = feats.to(device)
-                out = model(imgs, feats)
+                out = model(imgs)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -301,7 +228,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "hybrid_resnet18_6ch_deep_plus_noise_gradient_fft_handcrafted"
+    approach = "efficientnet_b0_6ch_adamw_onecyclelr_strong_aug"
 
     print(f"\n---")
     print(f"balanced_accuracy: {best_bal_acc:.6f}")
