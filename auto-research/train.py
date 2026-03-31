@@ -1,8 +1,8 @@
 """
-train.py — Liveness: Hybrid ResNet18 + handcrafted noise/freq features fused classifier
+train.py — Liveness: EfficientNet-B0 dual-stream (separate far/near encoders, late fusion)
 Best previous DGX1: 0.976659 (ResNet18 6ch baseline)
-Idea: Combine deep CNN features with proven-effective handcrafted features
-(noise, gradient, FFT) that got 1.0 on smaller dataset.
+Previous dual-stream (ResNet18): 0.969479 (worse - shared weights hurt)
+This: separate pretrained EfficientNet-B0 encoders for far and near, late fusion.
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -32,40 +32,10 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
 
-def extract_handcrafted(img_path):
-    """Extract noise/frequency features proven effective on this dataset."""
-    img = Image.open(str(img_path)).convert("RGB")
-    arr = np.array(img, dtype=np.float32)
-    gray = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
-
-    lap = np.abs(gray[2:,1:-1] + gray[:-2,1:-1] + gray[1:-1,2:] + gray[1:-1,:-2] - 4*gray[1:-1,1:-1])
-    noise_mean = float(np.mean(lap))
-    noise_std = float(np.std(lap))
-
-    gx = np.abs(gray[:,1:] - gray[:,:-1])
-    gy = np.abs(gray[1:,:] - gray[:-1,:])
-    grad_mean = float(np.mean(gx) + np.mean(gy)) / 2
-
-    fft = np.fft.fft2(gray)
-    fft_shift = np.fft.fftshift(fft)
-    h, w = gray.shape
-    cy, cx = h // 2, w // 2
-    r = min(h, w) // 8
-    mask = np.ones((h, w), dtype=bool)
-    yy, xx = np.ogrid[:h, :w]
-    mask[(yy - cy)**2 + (xx - cx)**2 <= r**2] = False
-    mag = np.abs(fft_shift)
-    total_e = float(np.sum(mag))
-    hf_ratio = float(np.sum(mag[mask])) / (total_e + 1e-8)
-
-    return [noise_mean, noise_std, grad_mean, hf_ratio]
-
-
-class HybridLivenessDataset(Dataset):
-    def __init__(self, sig_ids, labels, handcrafted_feats, transform=None):
+class DualImageDataset(Dataset):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
-        self.handcrafted = handcrafted_feats
         self.transform = transform
         self.samples_dir = DATA_DIR / "samples"
 
@@ -91,43 +61,31 @@ class HybridLivenessDataset(Dataset):
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
-        img = torch.cat([far_img, near_img], dim=0)
-        hc = torch.tensor(self.handcrafted[sig], dtype=torch.float32)
-        return img, hc, label
+        return far_img, near_img, label
 
 
-class HybridModel(nn.Module):
-    def __init__(self, hc_dim=8, num_classes=2):
+class DualEfficientNet(nn.Module):
+    def __init__(self, num_classes=2):
         super().__init__()
-        backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        old_conv = backbone.conv1
-        backbone.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        with torch.no_grad():
-            backbone.conv1.weight[:, :3] = old_conv.weight
-            backbone.conv1.weight[:, 3:] = old_conv.weight
-        self.features = nn.Sequential(*list(backbone.children())[:-1])
-        cnn_dim = 512
+        self.far_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+        self.near_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
 
-        self.hc_encoder = nn.Sequential(
-            nn.Linear(hc_dim, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, 32),
-            nn.ReLU(),
-        )
+        far_feat_dim = self.far_encoder.classifier[1].in_features
+        self.far_encoder.classifier = nn.Identity()
+        self.near_encoder.classifier = nn.Identity()
 
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(cnn_dim + 32, 128),
+            nn.Linear(far_feat_dim * 2, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(128, num_classes),
+            nn.Linear(256, num_classes),
         )
 
-    def forward(self, img, hc_feats):
-        cnn_out = self.features(img).flatten(1)
-        hc_out = self.hc_encoder(hc_feats)
-        fused = torch.cat([cnn_out, hc_out], dim=1)
+    def forward(self, far, near):
+        far_feats = self.far_encoder(far)
+        near_feats = self.near_encoder(near)
+        fused = torch.cat([far_feats, near_feats], dim=1)
         return self.classifier(fused)
 
 
@@ -143,25 +101,6 @@ def load_data():
             valid.append(sig)
 
     random.shuffle(valid)
-
-    print(f"Extracting handcrafted features for {len(valid)} samples...")
-    hc_feats = {}
-    for i, sig in enumerate(valid):
-        if i % 500 == 0:
-            print(f"  {i}/{len(valid)}")
-        try:
-            far_f = extract_handcrafted(DATA_DIR / "samples" / sig / "far.jpg")
-            near_f = extract_handcrafted(DATA_DIR / "samples" / sig / "near.jpg")
-            hc_feats[sig] = far_f + near_f
-        except Exception:
-            hc_feats[sig] = [0.0] * 8
-
-    all_feats = np.array([hc_feats[s] for s in valid])
-    feat_mean = all_feats.mean(axis=0)
-    feat_std = all_feats.std(axis=0) + 1e-8
-    for sig in valid:
-        hc_feats[sig] = ((np.array(hc_feats[sig]) - feat_mean) / feat_std).tolist()
-
     split = int(len(valid) * 0.8)
     train_ids = valid[:split]
     test_ids = valid[split:]
@@ -171,7 +110,7 @@ def load_data():
     print(f"Train: {len(train_ids)} {dict(dist_train)}")
     print(f"Test:  {len(test_ids)} {dict(dist_test)}")
 
-    return train_ids, test_ids, labels, hc_feats
+    return train_ids, test_ids, labels
 
 
 def train():
@@ -179,17 +118,15 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    train_ids, test_ids, labels, hc_feats = load_data()
+    train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((256, 256)),
-        T.RandomResizedCrop(224, scale=(0.75, 1.0)),
+        T.Resize((240, 240)),
+        T.RandomResizedCrop(224, scale=(0.8, 1.0)),
         T.RandomHorizontalFlip(),
-        T.RandomRotation(10),
         T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        T.RandomErasing(p=0.1),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -197,15 +134,15 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = HybridLivenessDataset(train_ids, labels, hc_feats, transform_train)
-    test_ds = HybridLivenessDataset(test_ids, labels, hc_feats, transform_test)
+    train_ds = DualImageDataset(train_ids, labels, transform_train)
+    test_ds = DualImageDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = HybridModel(hc_dim=8, num_classes=2).to(device)
+    model = DualEfficientNet(num_classes=2).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Hybrid ResNet18 + HC features, params: {num_params:,}")
+    print(f"Model: Dual EfficientNet-B0, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
@@ -213,12 +150,22 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.05)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
+    for param in model.far_encoder.features[:5].parameters():
+        param.requires_grad = False
+    for param in model.near_encoder.features[:5].parameters():
+        param.requires_grad = False
 
-    epochs = 15
+    optimizer = torch.optim.AdamW([
+        {"params": model.far_encoder.features[5:].parameters(), "lr": 5e-5},
+        {"params": model.near_encoder.features[5:].parameters(), "lr": 5e-5},
+        {"params": model.classifier.parameters(), "lr": 2e-4},
+    ], weight_decay=1e-3)
+
+    epochs = 12
+    total_steps = epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=2e-4, epochs=epochs, steps_per_epoch=len(train_loader),
-        pct_start=0.15, anneal_strategy='cos',
+        optimizer, max_lr=[5e-5, 5e-5, 2e-4], epochs=epochs,
+        steps_per_epoch=len(train_loader), pct_start=0.2,
     )
 
     best_bal_acc = 0
@@ -230,12 +177,22 @@ def train():
             print(f"Time budget reached at epoch {epoch}")
             break
 
+        if epoch == 3:
+            for param in model.far_encoder.features[:5].parameters():
+                param.requires_grad = True
+            for param in model.near_encoder.features[:5].parameters():
+                param.requires_grad = True
+            print("Unfroze early layers at epoch 3")
+
         model.train()
         total_loss = 0
-        for imgs, hc, targets in train_loader:
-            imgs, hc, targets = imgs.to(device), hc.to(device), targets.to(device)
+        for far_imgs, near_imgs, targets in train_loader:
+            far_imgs = far_imgs.to(device)
+            near_imgs = near_imgs.to(device)
+            targets = targets.to(device)
+
             optimizer.zero_grad()
-            out = model(imgs, hc)
+            out = model(far_imgs, near_imgs)
             loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -246,9 +203,10 @@ def train():
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for imgs, hc, targets in test_loader:
-                imgs, hc = imgs.to(device), hc.to(device)
-                out = model(imgs, hc)
+            for far_imgs, near_imgs, targets in test_loader:
+                far_imgs = far_imgs.to(device)
+                near_imgs = near_imgs.to(device)
+                out = model(far_imgs, near_imgs)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -266,7 +224,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "hybrid_resnet18_6ch_plus_8_handcrafted_noise_grad_fft_fused_MLP"
+    approach = "dual_efficientnet_b0_separate_encoders_late_fusion_gradual_unfreeze"
 
     result_block = (
         f"\n---\n"
