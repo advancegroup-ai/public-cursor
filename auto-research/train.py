@@ -1,17 +1,15 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
 
-Experiment: Dual-stream ResNet18 with cross-attention fusion.
-Separate pretrained encoders for far and near images, with a cross-attention
-module that lets each stream attend to the other before classification.
-This should capture far-near consistency cues important for liveness.
+Experiment: ResNet50 6ch + gradient accumulation + cosine warmup + dropout 0.5.
+Larger backbone for more capacity. Gradient accumulation enables effective batch
+size of 64 while keeping memory usage low.
 """
 import os
 import sys
 import json
 import time
 import random
-import math
 import numpy as np
 from pathlib import Path
 from collections import Counter
@@ -60,7 +58,7 @@ def load_labels():
     return labels
 
 
-class DualStreamDataset(Dataset):
+class LivenessDataset(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
@@ -89,68 +87,8 @@ class DualStreamDataset(Dataset):
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
-        return far_img, near_img, label
-
-
-class CrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-
-    def forward(self, x, context):
-        B, D = x.shape
-        q = self.q_proj(self.norm1(x)).view(B, self.num_heads, self.head_dim)
-        k = self.k_proj(self.norm2(context)).view(B, self.num_heads, self.head_dim)
-        v = self.v_proj(self.norm2(context)).view(B, self.num_heads, self.head_dim)
-
-        attn = (q * k).sum(-1) * self.scale
-        attn = attn.softmax(-1)
-
-        out = (attn.unsqueeze(-1) * v).view(B, D)
-        return x + self.out_proj(out)
-
-
-class DualStreamModel(nn.Module):
-    def __init__(self, num_classes=2):
-        super().__init__()
-        far_backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        near_backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-
-        self.far_encoder = nn.Sequential(*list(far_backbone.children())[:-1])
-        self.near_encoder = nn.Sequential(*list(near_backbone.children())[:-1])
-
-        feat_dim = 512
-
-        self.cross_attn_far = CrossAttention(feat_dim, num_heads=4)
-        self.cross_attn_near = CrossAttention(feat_dim, num_heads=4)
-
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(feat_dim * 2),
-            nn.Dropout(0.3),
-            nn.Linear(feat_dim * 2, 128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, far_img, near_img):
-        far_feat = self.far_encoder(far_img).flatten(1)
-        near_feat = self.near_encoder(near_img).flatten(1)
-
-        far_attended = self.cross_attn_far(far_feat, near_feat)
-        near_attended = self.cross_attn_near(near_feat, far_feat)
-
-        combined = torch.cat([far_attended, near_attended], dim=1)
-        return self.classifier(combined)
+        img = torch.cat([far_img, near_img], dim=0)
+        return img, label
 
 
 def load_data():
@@ -181,6 +119,24 @@ def load_data():
     return train_ids, test_ids, labels
 
 
+def build_resnet50_6ch(num_classes=2):
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    old_conv = model.conv1
+    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    with torch.no_grad():
+        model.conv1.weight[:, :3] = old_conv.weight
+        model.conv1.weight[:, 3:] = old_conv.weight
+
+    model.fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(model.fc.in_features, 256),
+        nn.ReLU(),
+        nn.Dropout(0.3),
+        nn.Linear(256, num_classes),
+    )
+    return model
+
+
 def train():
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -193,9 +149,12 @@ def train():
     transform_train = T.Compose([
         T.Resize((224, 224)),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        T.RandomRotation(10),
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+        T.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        T.RandomErasing(p=0.15, scale=(0.02, 0.1)),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -203,36 +162,42 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = DualStreamDataset(train_ids, labels, transform_train)
-    test_ds = DualStreamDataset(test_ids, labels, transform_test)
+    train_ds = LivenessDataset(train_ids, labels, transform_train)
+    test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DualStreamModel(num_classes=2).to(device)
+    model = build_resnet50_6ch().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Dual-stream ResNet18 + cross-attention, params: {num_params:,}")
+    print(f"Model: ResNet50 (6ch) + grad accum, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.05)
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
 
-    optimizer = torch.optim.AdamW([
-        {"params": model.far_encoder.parameters(), "lr": 5e-5},
-        {"params": model.near_encoder.parameters(), "lr": 5e-5},
-        {"params": model.cross_attn_far.parameters(), "lr": 2e-4},
-        {"params": model.cross_attn_near.parameters(), "lr": 2e-4},
-        {"params": model.classifier.parameters(), "lr": 2e-4},
-    ], weight_decay=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
+    epochs = 12
+    warmup_epochs = 2
+    total_steps = epochs * len(train_loader)
+    warmup_steps = warmup_epochs * len(train_loader)
 
-    epochs = 15
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        return 0.5 * (1 + np.cos(np.pi * progress))
 
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    accum_steps = 4
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
+    global_step = 0
+
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
             print(f"Time budget reached at epoch {epoch}")
@@ -240,28 +205,28 @@ def train():
 
         model.train()
         total_loss = 0
-        for far_imgs, near_imgs, targets in train_loader:
-            far_imgs = far_imgs.to(device)
-            near_imgs = near_imgs.to(device)
-            targets = targets.to(device)
+        optimizer.zero_grad()
 
-            optimizer.zero_grad()
-            out = model(far_imgs, near_imgs)
-            loss = criterion(out, targets)
+        for batch_idx, (imgs, targets) in enumerate(train_loader):
+            imgs, targets = imgs.to(device), targets.to(device)
+            out = model(imgs)
+            loss = criterion(out, targets) / accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item()
+            total_loss += loss.item() * accum_steps
 
-        scheduler.step(epoch)
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
 
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for far_imgs, near_imgs, targets in test_loader:
-                far_imgs = far_imgs.to(device)
-                near_imgs = near_imgs.to(device)
-                out = model(far_imgs, near_imgs)
+            for imgs, targets in test_loader:
+                imgs = imgs.to(device)
+                out = model(imgs)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -279,7 +244,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "dual_stream_resnet18_cross_attention_label_smoothing"
+    approach = "resnet50_6ch_grad_accum4_cosine_warmup_label_smooth_0.1"
 
     print(f"\n---")
     print(f"balanced_accuracy: {best_bal_acc:.6f}")
