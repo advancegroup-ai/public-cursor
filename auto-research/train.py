@@ -1,9 +1,8 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: Multi-scale ResNet18 with resolution fusion. Processes each image
-at 3 different scales (112, 224, 336) to capture both fine-grained artifacts
-(large scale) and global patterns (small scale). Features from each scale
-are concatenated before classification.
+Experiment: ConvNeXt-Tiny pretrained, 6-channel (far+near), with strong
+regularization (Stochastic Depth + CutMix + label smoothing).
+ConvNeXt is a modern CNN that matches ViT performance while being simpler.
 """
 import os
 import sys
@@ -35,29 +34,15 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
-class MultiScaleDataset(Dataset):
-    def __init__(self, sig_ids, labels, sizes=(112, 224, 336), is_train=True):
+class LivenessDataset(Dataset):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
-        self.sizes = sizes
-        self.is_train = is_train
+        self.transform = transform
         self.samples_dir = DATA_DIR / "samples"
-        self.normalize = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
     def __len__(self):
         return len(self.sig_ids)
-
-    def _load_img(self, path, size):
-        try:
-            img = Image.open(str(path)).convert("RGB")
-        except Exception:
-            img = Image.new("RGB", (size, size))
-        img = T.Resize((size, size))(img)
-        if self.is_train:
-            if random.random() > 0.5:
-                img = T.functional.hflip(img)
-            img = T.ColorJitter(0.2, 0.2, 0.1, 0.05)(img)
-        return self.normalize(T.ToTensor()(img))
 
     def __getitem__(self, idx):
         sig = self.sig_ids[idx]
@@ -67,59 +52,42 @@ class MultiScaleDataset(Dataset):
         far_path = self.samples_dir / sig / "far.jpg"
         near_path = self.samples_dir / sig / "near.jpg"
 
-        images = []
-        for size in self.sizes:
-            images.append(self._load_img(far_path, size))
-            images.append(self._load_img(near_path, size))
+        try:
+            far_img = Image.open(str(far_path)).convert("RGB")
+            near_img = Image.open(str(near_path)).convert("RGB")
+        except Exception:
+            far_img = Image.new("RGB", (224, 224))
+            near_img = Image.new("RGB", (224, 224))
 
-        return images, label
+        if self.transform:
+            far_img = self.transform(far_img)
+            near_img = self.transform(near_img)
 
-
-def collate_multiscale(batch):
-    """Custom collate for variable-size tensors."""
-    num_scales = len(batch[0][0])
-    batched_images = []
-    labels = []
-    for i in range(num_scales):
-        imgs = torch.stack([item[0][i] for item in batch])
-        batched_images.append(imgs)
-    labels = torch.tensor([item[1] for item in batch], dtype=torch.long)
-    return batched_images, labels
+        img = torch.cat([far_img, near_img], dim=0)
+        return img, label
 
 
-class MultiScaleModel(nn.Module):
-    def __init__(self, num_classes=2, sizes=(112, 224, 336)):
-        super().__init__()
-        self.num_scales = len(sizes)
+def cutmix_data(x, y, alpha=1.0):
+    """CutMix augmentation."""
+    lam = np.random.beta(alpha, alpha)
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
 
-        backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.shared_encoder = nn.Sequential(*list(backbone.children())[:-1])  # up to avgpool
-        feat_dim = 512
+    _, _, h, w = x.shape
+    cut_rat = np.sqrt(1.0 - lam)
+    cut_w = int(w * cut_rat)
+    cut_h = int(h * cut_rat)
+    cx = np.random.randint(w)
+    cy = np.random.randint(h)
+    x1 = np.clip(cx - cut_w // 2, 0, w)
+    y1 = np.clip(cy - cut_h // 2, 0, h)
+    x2 = np.clip(cx + cut_w // 2, 0, w)
+    y2 = np.clip(cy + cut_h // 2, 0, h)
 
-        self.scale_projections = nn.ModuleList([
-            nn.Linear(feat_dim, 128) for _ in range(self.num_scales * 2)
-        ])
-
-        total_feat = 128 * self.num_scales * 2
-        self.classifier = nn.Sequential(
-            nn.Linear(total_feat, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, image_list):
-        feats = []
-        for i, img in enumerate(image_list):
-            f = self.shared_encoder(img).flatten(1)
-            f = self.scale_projections[i](f)
-            feats.append(f)
-        combined = torch.cat(feats, dim=1)
-        return self.classifier(combined)
+    x_mixed = x.clone()
+    x_mixed[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+    lam = 1 - ((x2 - x1) * (y2 - y1)) / (w * h)
+    return x_mixed, y[index], lam
 
 
 def load_data():
@@ -146,6 +114,28 @@ def load_data():
     return train_ids, test_ids, labels
 
 
+def build_model(num_classes=2):
+    """ConvNeXt-Tiny pretrained, modified for 6-channel input."""
+    model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+
+    old_conv = model.features[0][0]
+    new_conv = nn.Conv2d(6, old_conv.out_channels,
+                         kernel_size=old_conv.kernel_size,
+                         stride=old_conv.stride,
+                         padding=old_conv.padding,
+                         bias=old_conv.bias is not None)
+    with torch.no_grad():
+        new_conv.weight[:, :3] = old_conv.weight
+        new_conv.weight[:, 3:] = old_conv.weight
+        if old_conv.bias is not None:
+            new_conv.bias.copy_(old_conv.bias)
+    model.features[0][0] = new_conv
+
+    in_features = model.classifier[2].in_features
+    model.classifier[2] = nn.Linear(in_features, num_classes)
+    return model
+
+
 def train():
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -153,32 +143,48 @@ def train():
 
     train_ids, test_ids, labels = load_data()
 
-    sizes = (112, 224, 336)
-    train_ds = MultiScaleDataset(train_ids, labels, sizes=sizes, is_train=True)
-    test_ds = MultiScaleDataset(test_ids, labels, sizes=sizes, is_train=False)
+    transform_train = T.Compose([
+        T.Resize((240, 240)),
+        T.RandomCrop(224),
+        T.RandomHorizontalFlip(),
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+        T.RandomGrayscale(p=0.05),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        T.RandomErasing(p=0.2),
+    ])
+    transform_test = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
 
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True,
-                              num_workers=4, pin_memory=True, collate_fn=collate_multiscale)
-    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False,
-                             num_workers=4, pin_memory=True, collate_fn=collate_multiscale)
+    train_ds = LivenessDataset(train_ids, labels, transform_train)
+    test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    model = MultiScaleModel(sizes=sizes).to(device)
+    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False,
+                             num_workers=4, pin_memory=True)
+
+    model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Multi-scale ResNet18 (shared encoder, 3 scales), params: {num_params:,}")
+    print(f"Model: ConvNeXt-Tiny (6-ch), params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-2)
     epochs = 12
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
+    use_cutmix = True
 
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS - 30:
@@ -187,12 +193,19 @@ def train():
 
         model.train()
         total_loss = 0
-        for image_list, targets in train_loader:
-            image_list = [img.to(device) for img in image_list]
-            targets = targets.to(device)
-            optimizer.zero_grad()
-            out = model(image_list)
-            loss = criterion(out, targets)
+        for imgs, targets in train_loader:
+            imgs, targets = imgs.to(device), targets.to(device)
+
+            if use_cutmix and random.random() > 0.5:
+                imgs_mixed, targets_shuffled, lam = cutmix_data(imgs, targets, alpha=1.0)
+                optimizer.zero_grad()
+                out = model(imgs_mixed)
+                loss = lam * criterion(out, targets) + (1 - lam) * criterion(out, targets_shuffled)
+            else:
+                optimizer.zero_grad()
+                out = model(imgs)
+                loss = criterion(out, targets)
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -203,9 +216,9 @@ def train():
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for image_list, targets in test_loader:
-                image_list = [img.to(device) for img in image_list]
-                out = model(image_list)
+            for imgs, targets in test_loader:
+                imgs = imgs.to(device)
+                out = model(imgs)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -224,7 +237,7 @@ def train():
 
     elapsed = time.time() - t0
 
-    approach = "multiscale_resnet18_shared_3scales_112_224_336_far_near"
+    approach = "convnext_tiny_6ch_cutmix_label_smooth_strong_aug"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
