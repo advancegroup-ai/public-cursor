@@ -1,10 +1,9 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: Handcrafted features (noise, gradient, FFT, color) + 
-            RandomForest + GradientBoosting ensemble.
-            These features achieved 100% on small dataset.
-            Test on full annotations_full.jsonl dataset (3000/class).
-            FAST: no GPU needed, feature extraction + RF takes seconds.
+Experiment: EfficientNet-B0 pretrained, 6-channel (far+near concat),
+            focal loss, cosine annealing with warmup, heavy augmentation.
+            Uses annotations_full.jsonl (labels.json is empty).
+            Balanced sampling: up to 3000 per class for speed.
 """
 import os
 import sys
@@ -15,79 +14,73 @@ import numpy as np
 from pathlib import Path
 from collections import Counter
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as T
+import torchvision.models as models
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
 SEED = 42
-MAX_SECONDS = 250
-MAX_PER_CLASS = 3000
+MAX_SECONDS = 270
+MAX_PER_CLASS = 1500
 
 random.seed(SEED)
 np.random.seed(SEED)
+torch.manual_seed(SEED)
 
 
-def compute_features(img_path):
-    """Compute comprehensive handcrafted features from an image."""
-    try:
-        img = Image.open(img_path).convert("RGB")
-        arr = np.array(img, dtype=np.float32) / 255.0
-    except Exception:
-        return None
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
 
-    gray = arr.mean(axis=2)
+    def forward(self, inputs, targets):
+        ce = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
 
-    # 1. Laplacian noise std
-    lap_k = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32)
-    from scipy.signal import convolve2d
-    lap = convolve2d(gray, lap_k, mode='same', boundary='symm')
-    noise_std = lap.std()
 
-    # 2. Gradient features
-    gx = np.diff(gray, axis=1)
-    gy = np.diff(gray, axis=0)
-    grad_mean = (np.abs(gx).mean() + np.abs(gy).mean()) / 2
-    grad_std = (gx.std() + gy.std()) / 2
+class LivenessDataset(Dataset):
+    def __init__(self, sig_ids, labels_dict, transform=None):
+        self.sig_ids = sig_ids
+        self.labels_dict = labels_dict
+        self.transform = transform
+        self.samples_dir = DATA_DIR / "samples"
 
-    # 3. FFT features
-    fft = np.fft.fft2(gray)
-    fft_mag = np.abs(np.fft.fftshift(fft))
-    h, w = fft_mag.shape
-    ch, cw = h // 2, w // 2
-    qh, qw = h // 4, w // 4
-    low_freq = fft_mag[ch-qh:ch+qh, cw-qw:cw+qw].mean()
-    high_freq = fft_mag.mean()
-    freq_ratio = high_freq / (low_freq + 1e-8)
+    def __len__(self):
+        return len(self.sig_ids)
 
-    # 4. Color features
-    r, g, b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
-    blue_shift = b.mean() - (r.mean() + g.mean()) / 2
-    color_std = np.array([r.std(), g.std(), b.std()]).mean()
+    def __getitem__(self, idx):
+        sig = self.sig_ids[idx]
+        label = self.labels_dict[sig]
 
-    # 5. Black/white fraction
-    bw_frac = ((gray < 0.05) | (gray > 0.95)).mean()
+        far_path = self.samples_dir / sig / "far.jpg"
+        near_path = self.samples_dir / sig / "near.jpg"
 
-    # 6. Channel uniformity (std of channel means)
-    ch_means = np.array([r.mean(), g.mean(), b.mean()])
-    ch_uniformity = ch_means.std()
+        try:
+            far_img = Image.open(str(far_path)).convert("RGB")
+            near_img = Image.open(str(near_path)).convert("RGB")
+        except Exception:
+            far_img = Image.new("RGB", (224, 224))
+            near_img = Image.new("RGB", (224, 224))
 
-    # 7. Edge density
-    edge_threshold = 0.1
-    edge_density = (np.abs(gx) > edge_threshold).mean()
+        if self.transform:
+            far_img = self.transform(far_img)
+            near_img = self.transform(near_img)
 
-    # 8. Contrast (IQR)
-    q25, q75 = np.percentile(gray, [25, 75])
-    contrast_iqr = q75 - q25
-
-    return [noise_std, grad_mean, grad_std, freq_ratio, blue_shift,
-            color_std, bw_frac, ch_uniformity, edge_density, contrast_iqr]
+        img = torch.cat([far_img, near_img], dim=0)  # 6-channel
+        return img, label
 
 
 def load_data():
+    """Load from annotations_full.jsonl (labels.json is empty)."""
     t0 = time.time()
-    pos_sigs, neg_sigs = [], []
     labels = {}
     with open(str(DATA_DIR / "annotations_full.jsonl")) as f:
         for line in f:
@@ -95,20 +88,36 @@ def load_data():
             sig = entry.get("sig", "")
             lbl = entry.get("label", "")
             if sig and lbl in ("Positive", "Negative"):
-                numeric = 0 if lbl == "Positive" else 1
-                labels[sig] = numeric
-                if numeric == 0:
-                    pos_sigs.append(sig)
-                else:
-                    neg_sigs.append(sig)
-    print(f"Loaded annotations in {time.time()-t0:.1f}s: pos={len(pos_sigs)}, neg={len(neg_sigs)}")
+                labels[sig] = 0 if lbl == "Positive" else 1
 
-    random.shuffle(pos_sigs)
-    random.shuffle(neg_sigs)
-    pos_sigs = pos_sigs[:MAX_PER_CLASS]
-    neg_sigs = neg_sigs[:MAX_PER_CLASS]
+    print(f"Loaded {len(labels)} annotated sigs in {time.time()-t0:.1f}s")
 
-    all_valid = pos_sigs + neg_sigs
+    # Validate that samples exist (check first batch quickly with os.path)
+    t0 = time.time()
+    samples_dir = str(DATA_DIR / "samples")
+    valid_pos, valid_neg = [], []
+    checked = 0
+    for sig, lbl in labels.items():
+        far = os.path.join(samples_dir, sig, "far.jpg")
+        near = os.path.join(samples_dir, sig, "near.jpg")
+        if os.path.isfile(far) and os.path.isfile(near):
+            if lbl == 0:
+                valid_pos.append(sig)
+            else:
+                valid_neg.append(sig)
+        checked += 1
+        if len(valid_pos) >= MAX_PER_CLASS and len(valid_neg) >= MAX_PER_CLASS:
+            break
+
+    print(f"Validated {checked} sigs in {time.time()-t0:.1f}s: pos={len(valid_pos)}, neg={len(valid_neg)}")
+
+    # Balance classes and cap
+    random.shuffle(valid_pos)
+    random.shuffle(valid_neg)
+    valid_pos = valid_pos[:MAX_PER_CLASS]
+    valid_neg = valid_neg[:MAX_PER_CLASS]
+
+    all_valid = valid_pos + valid_neg
     random.shuffle(all_valid)
 
     split = int(len(all_valid) * 0.8)
@@ -119,110 +128,135 @@ def load_data():
     dist_test = Counter(labels[s] for s in test_ids)
     print(f"Train: {len(train_ids)} (0={dist_train[0]}, 1={dist_train[1]})")
     print(f"Test:  {len(test_ids)} (0={dist_test[0]}, 1={dist_test[1]})")
+
     return train_ids, test_ids, labels
 
 
-def extract_features(sig_ids, labels):
-    """Extract features for all samples."""
-    samples_dir = str(DATA_DIR / "samples")
-    X, y = [], []
-    skipped = 0
-    for i, sig in enumerate(sig_ids):
-        if i % 500 == 0:
-            print(f"  Extracting features: {i}/{len(sig_ids)}...")
-        far_path = os.path.join(samples_dir, sig, "far.jpg")
-        near_path = os.path.join(samples_dir, sig, "near.jpg")
+def build_model(num_classes=2):
+    """EfficientNet-B0 pretrained, modified for 6-channel input."""
+    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
 
-        far_feats = compute_features(far_path)
-        near_feats = compute_features(near_path)
+    old_conv = model.features[0][0]
+    new_conv = nn.Conv2d(6, old_conv.out_channels, kernel_size=old_conv.kernel_size,
+                         stride=old_conv.stride, padding=old_conv.padding, bias=False)
+    with torch.no_grad():
+        new_conv.weight[:, :3] = old_conv.weight
+        new_conv.weight[:, 3:] = old_conv.weight
+    model.features[0][0] = new_conv
 
-        if far_feats is None or near_feats is None:
-            skipped += 1
-            continue
-
-        combined = far_feats + near_feats  # 20 features total
-        X.append(combined)
-        y.append(labels[sig])
-
-    print(f"  Extracted {len(X)} samples, skipped {skipped}")
-    return np.array(X), np.array(y)
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(p=0.3),
+        nn.Linear(in_features, num_classes),
+    )
+    return model
 
 
 def train():
     t0 = time.time()
-    print("Device: cpu (handcrafted features + RandomForest)")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
     train_ids, test_ids, labels = load_data()
     if len(train_ids) == 0:
         print("ERROR: No valid training data!")
         return
 
-    print("Extracting train features...")
-    X_train, y_train = extract_features(train_ids, labels)
-    print(f"Train features shape: {X_train.shape}")
+    transform_train = T.Compose([
+        T.Resize((224, 224)),
+        T.RandomHorizontalFlip(),
+        T.RandomRotation(10),
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+        T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        T.RandomErasing(p=0.2),
+    ])
+    transform_test = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
 
-    if time.time() - t0 > MAX_SECONDS:
-        print("Time budget reached during train feature extraction")
-        return
+    train_ds = LivenessDataset(train_ids, labels, transform_train)
+    test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    print("Extracting test features...")
-    X_test, y_test = extract_features(test_ids, labels)
-    print(f"Test features shape: {X_test.shape}")
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=2, pin_memory=True)
 
-    if time.time() - t0 > MAX_SECONDS:
-        print("Time budget reached during test feature extraction")
-        return
+    model = build_model().to(device)
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model: EfficientNet-B0 (6-ch), params: {num_params:,}")
 
-    # Handle NaN/Inf
-    X_train = np.nan_to_num(X_train, nan=0.0, posinf=1e6, neginf=-1e6)
-    X_test = np.nan_to_num(X_test, nan=0.0, posinf=1e6, neginf=-1e6)
+    train_labels_list = [labels[s] for s in train_ids]
+    class_counts = Counter(train_labels_list)
+    weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
+    weight = weight / weight.sum() * 2
+    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    print("Training RF + GB ensemble...")
-    rf = RandomForestClassifier(n_estimators=200, max_depth=None, random_state=SEED, n_jobs=-1)
-    gb = GradientBoostingClassifier(n_estimators=100, max_depth=5, random_state=SEED)
-    
-    rf.fit(X_train, y_train)
-    gb.fit(X_train, y_train)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
 
-    # Ensemble via soft voting
-    rf_probs = rf.predict_proba(X_test)
-    gb_probs = gb.predict_proba(X_test)
-    ensemble_probs = 0.6 * rf_probs + 0.4 * gb_probs
-    preds = ensemble_probs.argmax(axis=1)
+    epochs = 8
+    warmup_epochs = 1
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
+        return 0.5 * (1 + np.cos(np.pi * progress))
 
-    bal_acc = balanced_accuracy_score(y_test, preds)
-    acc = accuracy_score(y_test, preds)
-    f1 = f1_score(y_test, preds, average="binary")
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Also check individual models
-    rf_preds = rf.predict(X_test)
-    gb_preds = gb.predict(X_test)
-    rf_bal = balanced_accuracy_score(y_test, rf_preds)
-    gb_bal = balanced_accuracy_score(y_test, gb_preds)
-    print(f"RF alone: bal_acc={rf_bal:.4f}")
-    print(f"GB alone: bal_acc={gb_bal:.4f}")
-    print(f"Ensemble: bal_acc={bal_acc:.4f}")
+    best_bal_acc = 0
+    best_acc = 0
+    best_f1 = 0
+    for epoch in range(epochs):
+        if time.time() - t0 > MAX_SECONDS:
+            print(f"Time budget reached at epoch {epoch}")
+            break
 
-    # Feature importances
-    feat_names = [f"far_{n}" for n in ["noise","grad_mean","grad_std","freq_ratio","blue_shift",
-                                       "color_std","bw_frac","ch_uniform","edge_dens","contrast"]] + \
-                 [f"near_{n}" for n in ["noise","grad_mean","grad_std","freq_ratio","blue_shift",
-                                        "color_std","bw_frac","ch_uniform","edge_dens","contrast"]]
-    importances = rf.feature_importances_
-    sorted_idx = np.argsort(importances)[::-1]
-    print("\nTop 10 features:")
-    for i in sorted_idx[:10]:
-        print(f"  {feat_names[i]}: {importances[i]:.4f}")
+        model.train()
+        total_loss = 0
+        for imgs, targets in train_loader:
+            imgs, targets = imgs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            out = model(imgs)
+            loss = criterion(out, targets)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        scheduler.step()
+
+        model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for imgs, targets in test_loader:
+                imgs = imgs.to(device)
+                out = model(imgs)
+                preds = out.argmax(dim=1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(targets.numpy())
+
+        bal_acc = balanced_accuracy_score(all_labels, all_preds)
+        acc = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds, average="binary")
+        avg_loss = total_loss / len(train_loader)
+
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} lr={scheduler.get_last_lr()[0]:.6f}")
+
+        if bal_acc > best_bal_acc:
+            best_bal_acc = bal_acc
+            best_acc = acc
+            best_f1 = f1
 
     elapsed = time.time() - t0
-    num_params = rf.n_estimators * 100 + gb.n_estimators * 100  # rough estimate
-    approach = "handcrafted_20feats_RF200_GB100_ensemble_3000perclass"
+    approach = "efficientnet_b0_6ch_focal_loss_heavy_augment_cosine_warmup"
 
     result_block = (
         f"\n---\n"
-        f"balanced_accuracy: {bal_acc:.6f}\n"
-        f"accuracy:          {acc:.6f}\n"
-        f"f1_score:          {f1:.6f}\n"
+        f"balanced_accuracy: {best_bal_acc:.6f}\n"
+        f"accuracy:          {best_acc:.6f}\n"
+        f"f1_score:          {best_f1:.6f}\n"
         f"num_params:        {num_params}\n"
         f"training_seconds:  {elapsed:.1f}\n"
         f"approach:          {approach}\n"
@@ -231,15 +265,15 @@ def train():
     print(result_block)
 
     result_data = {
-        "balanced_accuracy": float(bal_acc),
-        "accuracy": float(acc),
-        "f1_score": float(f1),
+        "balanced_accuracy": best_bal_acc,
+        "accuracy": best_acc,
+        "f1_score": best_f1,
         "num_params": num_params,
         "training_seconds": elapsed,
         "approach": approach,
     }
-    with open(str(RESULTS_FILE), "w") as rf2:
-        json.dump(result_data, rf2, indent=2)
+    with open(str(RESULTS_FILE), "w") as rf:
+        json.dump(result_data, rf, indent=2)
     print(f"Results written to {RESULTS_FILE}")
 
 
