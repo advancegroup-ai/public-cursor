@@ -1,6 +1,6 @@
 """
-train.py — Liveness detection: EfficientNet-B0 + Focal Loss + balanced sampling + cosine warmup
-Efficiently handles large dataset (316k labels, 195k samples on NAS).
+train.py — Liveness detection: EfficientNet-B0 + Focal Loss + balanced sampling
+Optimized for speed: capped samples, fast epochs, writes results to NAS.
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -19,7 +19,7 @@ from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
 SEED = 42
-MAX_SECONDS = 180
+MAX_SECONDS = 150
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -74,9 +74,9 @@ class LivenessDataset(Dataset):
 
 
 def load_data():
-    """Load data efficiently: list sample dirs then cross-reference labels."""
+    """Load data: list disk dirs then cross-ref labels. Cap per class for speed."""
     t0 = time.time()
-    
+
     with open(str(DATA_DIR / "labels.json")) as f:
         labels = json.load(f)
     print(f"Labels loaded: {len(labels)} entries ({time.time()-t0:.1f}s)")
@@ -89,9 +89,10 @@ def load_data():
     negatives = []
     for sig in disk_ids:
         if sig in labels and "main_label" in labels[sig]:
-            if labels[sig]["main_label"] == "Positive":
+            ml = labels[sig]["main_label"]
+            if ml == "Positive":
                 positives.append(sig)
-            elif labels[sig]["main_label"] == "Negative":
+            elif ml == "Negative":
                 negatives.append(sig)
 
     print(f"Labeled on disk: {len(positives)} pos, {len(negatives)} neg ({time.time()-t0:.1f}s)")
@@ -99,7 +100,7 @@ def load_data():
     random.shuffle(positives)
     random.shuffle(negatives)
 
-    MAX_PER_CLASS = 5000
+    MAX_PER_CLASS = 2000
     positives = positives[:MAX_PER_CLASS]
     negatives = negatives[:MAX_PER_CLASS]
 
@@ -141,12 +142,12 @@ def build_model(num_classes=2):
     return model
 
 
-def get_cosine_warmup_scheduler(optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
+def get_cosine_warmup_scheduler(optimizer, warmup_epochs, total_epochs):
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
             return (epoch + 1) / warmup_epochs
         progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return max(min_lr / optimizer.defaults['lr'], 0.5 * (1 + math.cos(math.pi * progress)))
+        return max(1e-6 / optimizer.defaults['lr'], 0.5 * (1 + math.cos(math.pi * progress)))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
@@ -163,11 +164,10 @@ def train():
         T.RandomCrop(224),
         T.RandomHorizontalFlip(),
         T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
-        T.RandomGrayscale(p=0.05),
-        T.RandomRotation(15),
+        T.RandomRotation(10),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        T.RandomErasing(p=0.2),
+        T.RandomErasing(p=0.15),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -191,9 +191,9 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    epochs = 12
+    epochs = 10
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
-    scheduler = get_cosine_warmup_scheduler(optimizer, warmup_epochs=2, total_epochs=epochs)
+    scheduler = get_cosine_warmup_scheduler(optimizer, warmup_epochs=1, total_epochs=epochs)
 
     best_bal_acc = 0
     best_acc = 0
@@ -233,9 +233,8 @@ def train():
         acc = accuracy_score(all_labels, all_preds)
         f1 = f1_score(all_labels, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
-        lr_now = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} lr={lr_now:.6f} [{time.time()-t0:.0f}s]")
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} bal_acc={bal_acc:.4f} acc={acc:.4f} f1={f1:.4f} [{time.time()-t0:.0f}s]")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
@@ -244,7 +243,7 @@ def train():
 
     elapsed = time.time() - t0
 
-    approach = "efficientnet_b0_6ch_focal_loss_balanced_5k_cosine_warmup_heavy_aug"
+    approach = "efficientnet_b0_6ch_focal_balanced2k_cosine_warmup_aug"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
