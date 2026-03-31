@@ -1,10 +1,13 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: EfficientNet-B0 + DCT frequency domain features.
-Key idea: Screen replay attacks show specific frequency patterns (moiré, 
-refresh lines). We extract DCT features from both images and fuse them
-with EfficientNet-B0 deep features. This combines spatial understanding
-with frequency-domain attack detection.
+Experiment: ResNet50 6ch with multi-scale feature pyramid + gradient 
+accumulation + cosine warmup + TTA at inference.
+Key ideas:
+- ResNet50 for deeper features vs ResNet18
+- Extract features from multiple layers (layer2, layer3, layer4) and combine
+- Gradient accumulation (4 steps) for effective batch size 128
+- Warmup + cosine LR schedule
+- Test-time augmentation (original + horizontal flip) for more robust predictions
 Previous best on DGX1: 0.976659 (ResNet18 6ch baseline).
 """
 import os
@@ -39,60 +42,12 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
-def extract_dct_features(img_pil, n_features=32):
-    """Extract DCT-based frequency features from image."""
-    gray = np.array(img_pil.convert("L").resize((128, 128))).astype(np.float32)
-    
-    from scipy.fft import dct
-    dct_coeffs = dct(dct(gray, axis=0, norm='ortho'), axis=1, norm='ortho')
-    
-    h, w = dct_coeffs.shape
-    mag = np.abs(dct_coeffs)
-    
-    features = []
-    
-    zones = [(0, h//8, 0, w//8), (0, h//4, 0, w//4), (0, h//2, 0, w//2)]
-    total = mag.sum() + 1e-10
-    for y1, y2, x1, x2 in zones:
-        features.append(mag[y1:y2, x1:x2].sum() / total)
-    
-    features.append(mag[h//4:h//2, w//4:w//2].sum() / total)
-    features.append(mag[h//2:, w//2:].sum() / total)
-    
-    diag_energy = sum(mag[i, i] for i in range(min(h, w))) / total
-    features.append(diag_energy)
-    
-    row_energies = mag.sum(axis=1)
-    col_energies = mag.sum(axis=0)
-    features.append(np.std(row_energies) / (np.mean(row_energies) + 1e-10))
-    features.append(np.std(col_energies) / (np.mean(col_energies) + 1e-10))
-    
-    features.append(np.log1p(np.max(mag[1:, :])))
-    features.append(np.log1p(np.mean(mag[h//4:, :])))
-    
-    from scipy.ndimage import laplace
-    gray_full = np.array(img_pil.convert("L")).astype(np.float32)
-    lap = laplace(gray_full)
-    features.append(np.var(lap))
-    features.append(np.abs(lap).mean())
-    
-    gy = np.diff(gray_full, axis=0)
-    gx = np.diff(gray_full, axis=1)
-    features.append(np.abs(gy).mean())
-    features.append(np.abs(gx).mean())
-    features.append(np.std(gy))
-    features.append(np.std(gx))
-    
-    return np.array(features[:n_features], dtype=np.float32)
-
-
 class LivenessDataset(Dataset):
-    def __init__(self, sig_ids, labels, transform=None, dct_features=16):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
         self.transform = transform
         self.samples_dir = DATA_DIR / "samples"
-        self.dct_features = dct_features
 
     def __len__(self):
         return len(self.sig_ids)
@@ -112,60 +67,64 @@ class LivenessDataset(Dataset):
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
 
-        far_dct = extract_dct_features(far_img, self.dct_features)
-        near_dct = extract_dct_features(near_img, self.dct_features)
-        diff_dct = far_dct - near_dct
-        freq_feats = np.concatenate([far_dct, near_dct, diff_dct])
-        freq_feats = np.nan_to_num(freq_feats, nan=0.0, posinf=1e6, neginf=-1e6)
-        freq_tensor = torch.from_numpy(freq_feats)
-
         if self.transform:
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
         img = torch.cat([far_img, near_img], dim=0)
-        return img, freq_tensor, label
+        return img, label
 
 
-class EfficientNetFreq(nn.Module):
-    def __init__(self, freq_dim=48, num_classes=2):
+class MultiScaleResNet50(nn.Module):
+    """ResNet50 with multi-scale feature pyramid network for 6-channel input."""
+    def __init__(self, num_classes=2):
         super().__init__()
-        base = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-        
-        old_conv = base.features[0][0]
-        new_conv = nn.Conv2d(6, 32, kernel_size=3, stride=2, padding=1, bias=False)
-        with torch.no_grad():
-            new_conv.weight[:, :3] = old_conv.weight
-            new_conv.weight[:, 3:] = old_conv.weight
-        base.features[0][0] = new_conv
-        
-        feat_dim = base.classifier[1].in_features
-        base.classifier = nn.Identity()
-        self.backbone = base
+        base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
 
-        self.freq_proj = nn.Sequential(
-            nn.BatchNorm1d(freq_dim),
-            nn.Linear(freq_dim, 64),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 64),
-            nn.GELU(),
-        )
+        old_conv = base.conv1
+        base.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            base.conv1.weight[:, :3] = old_conv.weight
+            base.conv1.weight[:, 3:] = old_conv.weight
+
+        self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+        self.layer1 = base.layer1  # 256
+        self.layer2 = base.layer2  # 512
+        self.layer3 = base.layer3  # 1024
+        self.layer4 = base.layer4  # 2048
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.proj2 = nn.Linear(512, 256)
+        self.proj3 = nn.Linear(1024, 256)
+        self.proj4 = nn.Linear(2048, 256)
 
         self.classifier = nn.Sequential(
-            nn.LayerNorm(feat_dim + 64),
-            nn.Dropout(0.3),
-            nn.Linear(feat_dim + 64, 128),
+            nn.LayerNorm(256 * 3),
+            nn.Dropout(0.4),
+            nn.Linear(256 * 3, 256),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(128, num_classes),
+            nn.Linear(256, num_classes),
         )
 
-    def forward(self, img, freq):
-        deep_feat = self.backbone(img)
-        freq_feat = self.freq_proj(freq)
-        fused = torch.cat([deep_feat, freq_feat], dim=1)
-        return self.classifier(fused)
+    def forward(self, x):
+        x = self.stem(x)
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
+
+        f2 = self.pool(x2).flatten(1)
+        f3 = self.pool(x3).flatten(1)
+        f4 = self.pool(x4).flatten(1)
+
+        p2 = F.gelu(self.proj2(f2))
+        p3 = F.gelu(self.proj3(f3))
+        p4 = F.gelu(self.proj4(f4))
+
+        multi = torch.cat([p2, p3, p4], dim=1)
+        return self.classifier(multi)
 
 
 def load_data():
@@ -202,9 +161,10 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((256, 256)),
+        T.RandomCrop(224),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -213,31 +173,48 @@ def train():
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
+    transform_tta_flip = T.Compose([
+        T.Resize((224, 224)),
+        T.RandomHorizontalFlip(p=1.0),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
 
-    dct_n = 16
-    train_ds = LivenessDataset(train_ids, labels, transform_train, dct_features=dct_n)
-    test_ds = LivenessDataset(test_ids, labels, transform_test, dct_features=dct_n)
+    train_ds = LivenessDataset(train_ids, labels, transform_train)
+    test_ds = LivenessDataset(test_ids, labels, transform_test)
+    test_ds_flip = LivenessDataset(test_ids, labels, transform_tta_flip)
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader_flip = DataLoader(test_ds_flip, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = EfficientNetFreq(freq_dim=dct_n * 3).to(device)
+    model = MultiScaleResNet50().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: EfficientNet-B0 + DCT freq features, params: {num_params:,}")
+    print(f"Model: Multi-Scale ResNet50 (6ch), params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.05)
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-4)
     epochs = 15
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    accum_steps = 4
+
+    def lr_lambda(epoch):
+        warmup = 2
+        if epoch < warmup:
+            return (epoch + 1) / warmup
+        progress = (epoch - warmup) / max(1, epochs - warmup)
+        return max(1e-6 / 1e-4, 0.5 * (1 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
+    best_state = None
 
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
@@ -246,45 +223,61 @@ def train():
 
         model.train()
         total_loss = 0
-        for imgs, freq, targets in train_loader:
-            imgs = imgs.to(device)
-            freq = freq.to(device)
-            targets = targets.to(device)
-            optimizer.zero_grad()
-            out = model(imgs, freq)
-            loss = criterion(out, targets)
+        optimizer.zero_grad()
+        for step, (imgs, targets) in enumerate(train_loader):
+            imgs, targets = imgs.to(device), targets.to(device)
+            out = model(imgs)
+            loss = criterion(out, targets) / accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_loss += loss.item()
+
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * accum_steps
 
         scheduler.step()
 
         model.eval()
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for imgs, freq, targets in test_loader:
-                imgs = imgs.to(device)
-                freq = freq.to(device)
-                out = model(imgs, freq)
-                preds = out.argmax(dim=1).cpu().numpy()
-                all_preds.extend(preds)
-                all_labels.extend(targets.numpy())
+        all_probs = []
+        all_probs_flip = []
+        all_labels_list = []
 
-        bal_acc = balanced_accuracy_score(all_labels, all_preds)
-        acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average="binary")
+        with torch.no_grad():
+            for imgs, targets in test_loader:
+                imgs = imgs.to(device)
+                out = F.softmax(model(imgs), dim=1)
+                all_probs.append(out.cpu())
+                all_labels_list.extend(targets.numpy())
+
+            for imgs, targets in test_loader_flip:
+                imgs = imgs.to(device)
+                out = F.softmax(model(imgs), dim=1)
+                all_probs_flip.append(out.cpu())
+
+        all_probs = torch.cat(all_probs, dim=0)
+        all_probs_flip = torch.cat(all_probs_flip, dim=0)
+        tta_probs = (all_probs + all_probs_flip) / 2.0
+        tta_preds = tta_probs.argmax(dim=1).numpy()
+        no_tta_preds = all_probs.argmax(dim=1).numpy()
+
+        bal_acc = balanced_accuracy_score(all_labels_list, tta_preds)
+        bal_acc_no_tta = balanced_accuracy_score(all_labels_list, no_tta_preds)
+        acc = accuracy_score(all_labels_list, tta_preds)
+        f1 = f1_score(all_labels_list, tta_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
 
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f}(TTA)/{bal_acc_no_tta:.4f}(no-TTA) f1={f1:.4f}")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
             best_acc = acc
             best_f1 = f1
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     elapsed = time.time() - t0
-    approach = "efficientnet_b0_6ch_plus_dct_freq_features_fusion"
+    approach = "resnet50_multiscale_fpn_6ch_grad_accum4x_warmup_cosine_tta"
 
     result_block = (
         f"\n---\n"
