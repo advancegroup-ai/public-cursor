@@ -1,22 +1,20 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
 
-Experiment: ResNet18 pretrained 6-ch + MixUp + focal loss + cosine warmup + AdamW.
-Data loaded from neg_batch.json / pos_batch.json.
+Experiment: ResNet50 pretrained 6-ch, Adam lr=1e-4, 15 epochs, weighted CE.
+Bigger backbone should capture more complex patterns.
 """
 import os
 import sys
 import json
 import time
 import random
-import math
 import numpy as np
 from pathlib import Path
 from collections import Counter
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
@@ -37,7 +35,6 @@ if torch.cuda.is_available():
 
 
 def load_labels():
-    """Build label dict from neg_batch.json and pos_batch.json."""
     labels = {}
     for fname, default_label in [("neg_batch.json", "Negative"), ("pos_batch.json", "Positive")]:
         with open(str(DATA_DIR / fname)) as f:
@@ -51,19 +48,6 @@ def load_labels():
                     main_label = "Negative"
                 labels[sig] = {"main_label": main_label, "pn": d["pn"]}
     return labels
-
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, inputs, targets):
-        ce = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
-        pt = torch.exp(-ce)
-        loss = ((1 - pt) ** self.gamma) * ce
-        return loss.mean()
 
 
 class LivenessDataset(Dataset):
@@ -128,8 +112,8 @@ def load_data():
 
 
 def build_model(num_classes=2):
-    """ResNet18 pretrained, modified for 6-channel input (far+near concat)."""
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    """ResNet50 pretrained, modified for 6-channel input."""
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
     old_conv = model.conv1
     model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
     with torch.no_grad():
@@ -137,31 +121,6 @@ def build_model(num_classes=2):
         model.conv1.weight[:, 3:] = old_conv.weight
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
-
-
-def mixup_data(x, y, alpha=0.2):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1.0
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size, device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[index]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-
-def mixup_criterion(criterion_fn, pred, y_a, y_b, lam):
-    return lam * criterion_fn(pred, y_a) + (1 - lam) * criterion_fn(pred, y_b)
-
-
-def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def train():
@@ -172,10 +131,9 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((240, 240)),
-        T.RandomCrop(224),
+        T.Resize((224, 224)),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+        T.ColorJitter(brightness=0.2, contrast=0.2),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -193,27 +151,21 @@ def train():
 
     model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 (6-ch) + MixUp + FocalLoss + CosineWarmup, params: {num_params:,}")
+    print(f"Model: ResNet50 (6-ch), params: {num_params:,}")
 
     train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels_list)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    focal = FocalLoss(alpha=weight.to(device), gamma=2.0)
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
 
-    def criterion_fn(pred, target):
-        return focal(pred, target)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
-    epochs = 20
-    steps_per_epoch = len(train_loader)
-    total_steps = epochs * steps_per_epoch
-    warmup_steps = 2 * steps_per_epoch
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=15)
 
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
+    epochs = 15
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
             print(f"Time budget reached at epoch {epoch}")
@@ -223,14 +175,14 @@ def train():
         total_loss = 0
         for imgs, targets in train_loader:
             imgs, targets = imgs.to(device), targets.to(device)
-            mixed_imgs, targets_a, targets_b, lam = mixup_data(imgs, targets, alpha=0.2)
             optimizer.zero_grad()
-            out = model(mixed_imgs)
-            loss = mixup_criterion(criterion_fn, out, targets_a, targets_b, lam)
+            out = model(imgs)
+            loss = criterion(out, targets)
             loss.backward()
             optimizer.step()
-            scheduler.step()
             total_loss += loss.item()
+
+        scheduler.step()
 
         model.eval()
         all_preds, all_labels = [], []
@@ -255,7 +207,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "resnet18_6ch_mixup_focal_cosine_warmup_adamw"
+    approach = "resnet50_6ch_adam_lr1e4_cosine_15ep"
 
     print(f"\n---")
     print(f"balanced_accuracy: {best_bal_acc:.6f}")
