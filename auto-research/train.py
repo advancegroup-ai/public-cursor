@@ -1,8 +1,19 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
 
-Experiment 1: Baseline ResNet18 pretrained, 6-channel (far+near concat).
-Data loaded from neg_batch.json / pos_batch.json.
+This is the file the Cloud Agent modifies. It runs on DGX1 with:
+- 4x V100-32GB, PyTorch 2.4.0+cu121
+- NAS access: /mnt/nas/public2/simon/projects/auto_research/liveness-research/data/
+
+Output format (must print exactly):
+---
+balanced_accuracy: 0.XXXX
+accuracy:          0.XXXX
+f1_score:          0.XXXX
+num_params:        NNNNN
+training_seconds:  NNN.N
+approach:          description_here
+---
 """
 import os
 import sys
@@ -20,35 +31,15 @@ import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold
 
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
-RESULTS_FILE = DATA_DIR / "last_result.json"
+RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
 SEED = 42
-MAX_SECONDS = 270
+MAX_SECONDS = 270  # leave margin within 5-min budget
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-
-
-def load_labels():
-    """Build label dict from neg_batch.json and pos_batch.json."""
-    labels = {}
-    for fname, default_label in [("neg_batch.json", "Negative"), ("pos_batch.json", "Positive")]:
-        with open(str(DATA_DIR / fname)) as f:
-            batch = json.load(f)
-        for d in batch.get("data", []):
-            parts = d["sample_id"].split("_")
-            if len(parts) >= 4:
-                sig = parts[3]
-                main_label = d["pn"].split("/")[0]
-                if main_label in ("Negative Type", "Negative_Type"):
-                    main_label = "Negative"
-                labels[sig] = {"main_label": main_label, "pn": d["pn"]}
-    return labels
 
 
 class LivenessDataset(Dataset):
@@ -73,6 +64,7 @@ class LivenessDataset(Dataset):
             far_img = Image.open(str(far_path)).convert("RGB")
             near_img = Image.open(str(near_path)).convert("RGB")
         except Exception:
+            # Return a black placeholder for corrupted images
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
 
@@ -80,29 +72,26 @@ class LivenessDataset(Dataset):
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
-        img = torch.cat([far_img, near_img], dim=0)  # 6-channel
+        img = torch.cat([far_img, near_img], dim=0)  # 6-channel input
         return img, label
 
 
 def load_data():
-    labels = load_labels()
-    samples_dir = DATA_DIR / "samples"
-    all_sigs = set(os.listdir(str(samples_dir)))
+    with open(str(DATA_DIR / "labels.json")) as f:
+        labels = json.load(f)
 
-    valid_sigs = [s for s in labels if s in all_sigs
-                  and (samples_dir / s / "far.jpg").exists()
-                  and (samples_dir / s / "near.jpg").exists()]
+    # Filter valid samples
+    valid = []
+    for sig, info in labels.items():
+        far = DATA_DIR / "samples" / sig / "far.jpg"
+        near = DATA_DIR / "samples" / sig / "near.jpg"
+        if far.exists() and near.exists():
+            valid.append(sig)
 
-    binary_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in valid_sigs]
-    print(f"Total valid samples: {len(valid_sigs)}")
-    print(f"Distribution: {Counter(binary_labels)}")
-
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(valid_sigs, binary_labels)):
-        if fold_idx == 0:
-            train_ids = [valid_sigs[i] for i in train_idx]
-            test_ids = [valid_sigs[i] for i in test_idx]
-            break
+    random.shuffle(valid)
+    split = int(len(valid) * 0.8)
+    train_ids = valid[:split]
+    test_ids = valid[split:]
 
     dist_train = Counter(labels[s]["main_label"] for s in train_ids)
     dist_test = Counter(labels[s]["main_label"] for s in test_ids)
@@ -115,11 +104,15 @@ def load_data():
 def build_model(num_classes=2):
     """ResNet18 pretrained, modified for 6-channel input (far+near concat)."""
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+    # Modify first conv to accept 6 channels
     old_conv = model.conv1
     model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
     with torch.no_grad():
+        # Init: duplicate pretrained 3-ch weights for both far and near
         model.conv1.weight[:, :3] = old_conv.weight
         model.conv1.weight[:, 3:] = old_conv.weight
+
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
@@ -128,8 +121,6 @@ def train():
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}, count: {torch.cuda.device_count()}")
 
     train_ids, test_ids, labels = load_data()
 
@@ -156,6 +147,7 @@ def train():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: ResNet18 (6-ch), params: {num_params:,}")
 
+    # Weighted loss for class imbalance
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
@@ -165,10 +157,9 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 
+    # Train
     best_bal_acc = 0
-    best_acc = 0
-    best_f1 = 0
-    epochs = 15
+    epochs = 10
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
             print(f"Time budget reached at epoch {epoch}")
@@ -187,6 +178,7 @@ def train():
 
         scheduler.step()
 
+        # Eval
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
@@ -211,26 +203,32 @@ def train():
 
     elapsed = time.time() - t0
 
-    print(f"\n---")
-    print(f"balanced_accuracy: {best_bal_acc:.6f}")
-    print(f"accuracy:          {best_acc:.6f}")
-    print(f"f1_score:          {best_f1:.6f}")
-    print(f"num_params:        {num_params}")
-    print(f"training_seconds:  {elapsed:.1f}")
-    print(f"approach:          resnet18_6ch_baseline")
-    print(f"---")
-
+    # Output in required format (both print and write to file for pipeline compatibility)
+    result_block = (
+        f"\n---\n"
+        f"balanced_accuracy: {best_bal_acc:.6f}\n"
+        f"accuracy:          {best_acc:.6f}\n"
+        f"f1_score:          {best_f1:.6f}\n"
+        f"num_params:        {num_params}\n"
+        f"training_seconds:  {elapsed:.1f}\n"
+        f"approach:          resnet18_pretrained_6ch_far_near\n"
+        f"---\n"
+    )
+    print(result_block)
+    
+    # Also write to file (pipeline stdout capture is unreliable)
     result_data = {
         "balanced_accuracy": best_bal_acc,
         "accuracy": best_acc,
         "f1_score": best_f1,
         "num_params": num_params,
         "training_seconds": elapsed,
-        "approach": "resnet18_6ch_baseline",
+        "approach": "resnet18_pretrained_6ch_far_near",
     }
     with open(str(RESULTS_FILE), "w") as rf:
         json.dump(result_data, rf, indent=2)
     print(f"Results written to {RESULTS_FILE}")
 
 
+# Always run when executed (pipeline uses exec(), not __main__)
 train()
