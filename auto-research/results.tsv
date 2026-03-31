@@ -34,5 +34,11 @@ ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders
 9de2fd6	0.970208	discard	[DGX1] EfficientNet-B0 6ch + focal loss + OneCycleLR + strong aug (9 epochs, 252.5s)
 a085e47	N/A	blocked	[DGX1] Hybrid ResNet18 + handcrafted noise/freq features fused MLP - token expired
 1aa02e7	N/A	blocked	[DGX1] ResNet18 6ch tuned - OneCycleLR + TTA + strong aug + grad accum - token expired
---- iter20 experiments ---
-46fcf12	N/A	blocked	[DGX1] ResNet18 6ch + focal loss + OneCycleLR + dropout 0.3 + strong aug + TTA5 - refresh token consumed
+--- iter20 experiments (prepared, auth blocked - refresh token consumed) ---
+4214fe5	N/A	blocked	[DGX1] ResNet18 6ch + OneCycleLR + label smoothing 0.1 + strong aug + grad accum
+0469cfe	N/A	blocked	[DGX1] Handcrafted 17 features (noise, grad, FFT, color, saturation) + RF200 + 5-fold CV
+46fcf12	N/A	blocked	[DGX1] ResNet18 6ch + focal loss + OneCycleLR + dropout 0.3 + strong aug + TTA5
+c4a231f	N/A	blocked	[DGX1] Hybrid ResNet18 6ch + 8 handcrafted noise/grad/FFT features fused MLP classifier
+33ad97e	N/A	blocked	[DGX1] Dual EfficientNet-B0 separate encoders + late fusion + gradual unfreeze
+72c88cb	N/A	blocked	[DGX1] ResNet50 6ch + MixUp 0.3 + label smoothing 0.1 + dropout 0.4 + OneCycleLR
+4885ad4	N/A	blocked	[DGX1] ResNet18 shared encoder + cross-attention far/near + GeM pooling
