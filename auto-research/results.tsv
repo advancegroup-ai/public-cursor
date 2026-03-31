@@ -39,5 +39,9 @@ N/A	0.955816	discard	[DGX1] ResNet50 6ch + AdamW + OneCycleLR + AMP + strong aug
 N/A	0.974318	discard	[DGX1] ResNet50 6ch + dropout 0.3 + AdamW lr=1e-4 + cosine + AMP
 N/A	0.975109	discard	[DGX1] ConvNeXt-Tiny 6ch + Adam lr=1e-4 + cosine + AMP (only 4 epochs)
 N/A	0.826417	discard	[DGX1] Handcrafted 12 features + RF200/GB200 ensemble 5-fold CV
---- iter31 experiments (auth blocked - refresh token consumed) ---
-ab867b2	N/A	blocked	[DGX1] Hybrid dual ResNet18 shared + noise/freq features + SWA + TTA + focal loss
+--- iter31 experiments (auth blocked - refresh token consumed, 5 experiments prepared) ---
+ab867b2	N/A	blocked	[DGX1] Hybrid dual ResNet18 shared + noise/freq handcrafted + SWA + TTA + focal loss
+b8dbff8	N/A	blocked	[DGX1] Dual-stream ResNet18 shared + MixUp + label smoothing + warmup cosine + TTA
+9491929	N/A	blocked	[DGX1] Dual-stream ResNet18 shared + cross-attention feature fusion + focal loss + diff LR + TTA
+ac0d26e	N/A	blocked	[DGX1] Triple-stream (far+near+diff) ResNet18 shared + gated fusion + focal loss + TTA
+c78e45a	N/A	blocked	[DGX1] Dual EfficientNet-V2-S shared + GeM pooling + focal loss + AMP + diff LR + TTA
