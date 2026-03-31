@@ -30,3 +30,10 @@ c8ca6ed	0.966667	discard	AdaBoost 3 stumps + 2 noise - close but not perfect
 --- iter2 DGX1 deep learning experiments (real 2586-sample dataset) ---
 6dc40d3	0.976659	keep	[DGX1] ResNet18 pretrained 6ch (far+near) baseline, Adam lr=1e-4, 15 epochs
 ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders) + OneCycleLR - worse than single stream
+--- iter13 experiments (VT_TOKEN missing - could not execute on DGX1) ---
+ad837f7	N/A	blocked	[DGX1] EfficientNet-B0 6ch + focal loss + RandAugment + cosine warmup LR
+ae8811a	N/A	blocked	[DGX1] ResNet18 6ch + MixUp + label smoothing + heavy augment + cosine warmup
+3e497f9	N/A	blocked	[DGX1] Hybrid ResNet18 + handcrafted noise/freq features fused classifier
+48a6bfe	N/A	blocked	[DGX1] Dual ViT-B/16 shared encoder + cross-attention fusion + focal loss
+30a56fa	N/A	blocked	[DGX1] ResNet50 6ch + heavy augment + cosine warm restarts + label smoothing
+--- iter14 experiments ---
