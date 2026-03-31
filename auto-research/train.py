@@ -1,31 +1,15 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-
-This is the file the Cloud Agent modifies. It runs on DGX1 with:
-- 4x V100-32GB, PyTorch 2.4.0+cu121
-- NAS access: /mnt/nas/public2/simon/projects/auto_research/liveness-research/data/
-
-Output format (must print exactly):
----
-balanced_accuracy: 0.XXXX
-accuracy:          0.XXXX
-f1_score:          0.XXXX
-num_params:        NNNNN
-training_seconds:  NNN.N
-approach:          description_here
----
+Experiment: EfficientNet-B0 6ch + RandAugment + label smoothing + focal loss + warmup cosine LR
 """
-import os
-import sys
-import json
-import time
-import random
+import os, sys, json, time, random, math
 import numpy as np
 from pathlib import Path
 from collections import Counter
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
@@ -35,11 +19,38 @@ from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
 SEED = 42
-MAX_SECONDS = 270  # leave margin within 5-min budget
+MAX_SECONDS = 270
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.05):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        n_classes = logits.size(1)
+        smooth_targets = torch.zeros_like(logits).scatter_(
+            1, targets.unsqueeze(1), 1.0
+        )
+        smooth_targets = smooth_targets * (1.0 - self.label_smoothing) + self.label_smoothing / n_classes
+
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+
+        focal_weight = (1 - probs) ** self.gamma
+        loss = -focal_weight * smooth_targets * log_probs
+
+        if self.alpha is not None:
+            alpha_weight = self.alpha[targets].unsqueeze(1)
+            loss = loss * alpha_weight
+
+        return loss.sum(dim=1).mean()
 
 
 class LivenessDataset(Dataset):
@@ -64,7 +75,6 @@ class LivenessDataset(Dataset):
             far_img = Image.open(str(far_path)).convert("RGB")
             near_img = Image.open(str(near_path)).convert("RGB")
         except Exception:
-            # Return a black placeholder for corrupted images
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
 
@@ -72,7 +82,7 @@ class LivenessDataset(Dataset):
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
-        img = torch.cat([far_img, near_img], dim=0)  # 6-channel input
+        img = torch.cat([far_img, near_img], dim=0)
         return img, label
 
 
@@ -80,7 +90,6 @@ def load_data():
     with open(str(DATA_DIR / "labels.json")) as f:
         labels = json.load(f)
 
-    # Filter valid samples
     valid = []
     for sig, info in labels.items():
         far = DATA_DIR / "samples" / sig / "far.jpg"
@@ -102,19 +111,32 @@ def load_data():
 
 
 def build_model(num_classes=2):
-    """ResNet18 pretrained, modified for 6-channel input (far+near concat)."""
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    """EfficientNet-B0 pretrained, modified for 6-channel input."""
+    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
 
-    # Modify first conv to accept 6 channels
-    old_conv = model.conv1
-    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    old_conv = model.features[0][0]
+    new_conv = nn.Conv2d(6, old_conv.out_channels, kernel_size=old_conv.kernel_size,
+                         stride=old_conv.stride, padding=old_conv.padding, bias=False)
     with torch.no_grad():
-        # Init: duplicate pretrained 3-ch weights for both far and near
-        model.conv1.weight[:, :3] = old_conv.weight
-        model.conv1.weight[:, 3:] = old_conv.weight
+        new_conv.weight[:, :3] = old_conv.weight
+        new_conv.weight[:, 3:] = old_conv.weight
+    model.features[0][0] = new_conv
 
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(p=0.3),
+        nn.Linear(in_features, num_classes),
+    )
     return model
+
+
+def get_cosine_warmup_scheduler(optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return max(min_lr / optimizer.defaults['lr'], 0.5 * (1 + math.cos(math.pi * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def train():
@@ -125,11 +147,13 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((240, 240)),
+        T.RandomCrop(224),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2),
+        T.RandAugment(num_ops=2, magnitude=9),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        T.RandomErasing(p=0.1),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -145,21 +169,22 @@ def train():
 
     model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 (6-ch), params: {num_params:,}")
+    print(f"Model: EfficientNet-B0 (6-ch), params: {num_params:,}")
 
-    # Weighted loss for class imbalance
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
-    weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
-    weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    alpha = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
+    alpha = alpha / alpha.sum() * 2
+    criterion = FocalLoss(alpha=alpha.to(device), gamma=2.0, label_smoothing=0.05)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
+    epochs = 15
+    scheduler = get_cosine_warmup_scheduler(optimizer, warmup_epochs=2, total_epochs=epochs)
 
-    # Train
     best_bal_acc = 0
-    epochs = 10
+    best_acc = 0
+    best_f1 = 0
+
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
             print(f"Time budget reached at epoch {epoch}")
@@ -173,12 +198,12 @@ def train():
             out = model(imgs)
             loss = criterion(out, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
 
         scheduler.step()
 
-        # Eval
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
@@ -194,7 +219,7 @@ def train():
         f1 = f1_score(all_labels, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
 
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} lr={optimizer.param_groups[0]['lr']:.6f}")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
@@ -203,7 +228,7 @@ def train():
 
     elapsed = time.time() - t0
 
-    # Output in required format (both print and write to file for pipeline compatibility)
+    approach = "efficientnet_b0_6ch_randaugment_focal_loss_label_smooth_warmup_cosine"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
@@ -211,24 +236,22 @@ def train():
         f"f1_score:          {best_f1:.6f}\n"
         f"num_params:        {num_params}\n"
         f"training_seconds:  {elapsed:.1f}\n"
-        f"approach:          resnet18_pretrained_6ch_far_near\n"
+        f"approach:          {approach}\n"
         f"---\n"
     )
     print(result_block)
-    
-    # Also write to file (pipeline stdout capture is unreliable)
+
     result_data = {
         "balanced_accuracy": best_bal_acc,
         "accuracy": best_acc,
         "f1_score": best_f1,
         "num_params": num_params,
         "training_seconds": elapsed,
-        "approach": "resnet18_pretrained_6ch_far_near",
+        "approach": approach,
     }
     with open(str(RESULTS_FILE), "w") as rf:
         json.dump(result_data, rf, indent=2)
     print(f"Results written to {RESULTS_FILE}")
 
 
-# Always run when executed (pipeline uses exec(), not __main__)
 train()
