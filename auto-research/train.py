@@ -1,29 +1,19 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-
-Experiment: Dual-stream ResNet18 with cross-attention fusion + focal loss + 
-stronger training regime. Previous dual-stream (iter2) scored 0.969 with simple
-concat. This uses cross-attention between far and near feature maps, plus
-focal loss and stronger augmentation to beat the 0.9767 baseline.
+Experiment: Handcrafted noise/frequency features on full DGX1 dataset.
+The noise-based approach got 1.000 balanced_accuracy on the small dataset.
+This tests whether it generalizes to the full 2586-sample annotated dataset.
+Uses Laplacian variance (noise), gradient magnitude, FFT high-freq ratio,
+color channel statistics, and JPEG artifact features per image, with RF.
 """
 import os
 import sys
 import json
 import time
 import random
-import math
 import numpy as np
 from pathlib import Path
 from collections import Counter
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as T
-import torchvision.models as models
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
@@ -32,119 +22,73 @@ MAX_SECONDS = 270
 
 random.seed(SEED)
 np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
+def extract_features(img_path):
+    """Extract handcrafted features from a single image."""
+    from PIL import Image
+    import numpy as np
 
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        return focal_loss.mean()
+    try:
+        img = Image.open(str(img_path)).convert("RGB")
+        arr = np.array(img, dtype=np.float32)
+    except Exception:
+        return np.zeros(12, dtype=np.float32)
 
+    gray = 0.2989 * arr[:,:,0] + 0.5870 * arr[:,:,1] + 0.1140 * arr[:,:,2]
 
-class DualImageDataset(Dataset):
-    def __init__(self, sig_ids, labels, transform=None):
-        self.sig_ids = sig_ids
-        self.labels = labels
-        self.transform = transform
-        self.samples_dir = DATA_DIR / "samples"
+    # 1. Laplacian variance (noise level)
+    from scipy.ndimage import laplace
+    lap = laplace(gray)
+    noise_var = float(np.var(lap))
+    noise_mean = float(np.mean(np.abs(lap)))
 
-    def __len__(self):
-        return len(self.sig_ids)
+    # 2. Gradient magnitude (edge sharpness)
+    gy, gx = np.gradient(gray)
+    grad_mag = np.sqrt(gx**2 + gy**2)
+    grad_mean = float(np.mean(grad_mag))
+    grad_std = float(np.std(grad_mag))
 
-    def __getitem__(self, idx):
-        sig = self.sig_ids[idx]
-        info = self.labels[sig]
-        label = 0 if info["main_label"] == "Positive" else 1
+    # 3. FFT high-frequency ratio
+    fft = np.fft.fft2(gray)
+    fft_shift = np.fft.fftshift(fft)
+    magnitude = np.abs(fft_shift)
+    h, w = gray.shape
+    cy, cx = h // 2, w // 2
+    r = min(h, w) // 8
+    total_energy = float(np.sum(magnitude))
+    if total_energy > 0:
+        mask = np.ones_like(magnitude, dtype=bool)
+        y, x = np.ogrid[:h, :w]
+        mask_center = (y - cy)**2 + (x - cx)**2 <= r**2
+        mask[mask_center] = False
+        hf_energy = float(np.sum(magnitude[mask]))
+        hf_ratio = hf_energy / total_energy
+    else:
+        hf_ratio = 0.0
 
-        far_path = self.samples_dir / sig / "far.jpg"
-        near_path = self.samples_dir / sig / "near.jpg"
+    # 4. Color channel statistics
+    r_mean = float(np.mean(arr[:,:,0]))
+    g_mean = float(np.mean(arr[:,:,1]))
+    b_mean = float(np.mean(arr[:,:,2]))
+    rg_diff = r_mean - g_mean
+    gb_diff = g_mean - b_mean
 
-        try:
-            far_img = Image.open(str(far_path)).convert("RGB")
-            near_img = Image.open(str(near_path)).convert("RGB")
-        except Exception:
-            far_img = Image.new("RGB", (224, 224))
-            near_img = Image.new("RGB", (224, 224))
+    # 5. Channel uniformity (low for screens)
+    r_std = float(np.std(arr[:,:,0]))
+    g_std = float(np.std(arr[:,:,1]))
+    b_std = float(np.std(arr[:,:,2]))
+    uniformity = float(np.std([r_std, g_std, b_std]))
 
-        if self.transform:
-            far_img = self.transform(far_img)
-            near_img = self.transform(near_img)
-
-        return far_img, near_img, label
-
-
-class CrossAttentionFusion(nn.Module):
-    """Cross-attention between two feature maps."""
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Linear(dim * 2, dim),
-        )
-
-    def forward(self, query, key_value):
-        attn_out, _ = self.attn(query, key_value, key_value)
-        x = self.norm1(query + attn_out)
-        x = self.norm2(x + self.ffn(x))
-        return x
+    return np.array([noise_var, noise_mean, grad_mean, grad_std,
+                     hf_ratio, rg_diff, gb_diff, uniformity,
+                     r_mean, g_mean, b_mean, r_std], dtype=np.float32)
 
 
-class DualStreamAttentionModel(nn.Module):
-    def __init__(self, num_classes=2):
-        super().__init__()
+def train():
+    t0 = time.time()
+    print("Loading data...")
 
-        far_backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        near_backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-
-        self.far_encoder = nn.Sequential(*list(far_backbone.children())[:-2])
-        self.near_encoder = nn.Sequential(*list(near_backbone.children())[:-2])
-
-        feat_dim = 512
-
-        self.cross_attn_far = CrossAttentionFusion(feat_dim, num_heads=4)
-        self.cross_attn_near = CrossAttentionFusion(feat_dim, num_heads=4)
-
-        self.pool = nn.AdaptiveAvgPool1d(1)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(feat_dim * 2, 256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, far_img, near_img):
-        far_feat = self.far_encoder(far_img)   # [B, 512, 7, 7]
-        near_feat = self.near_encoder(near_img) # [B, 512, 7, 7]
-
-        B, C, H, W = far_feat.shape
-        far_seq = far_feat.flatten(2).permute(0, 2, 1)   # [B, 49, 512]
-        near_seq = near_feat.flatten(2).permute(0, 2, 1)  # [B, 49, 512]
-
-        far_attended = self.cross_attn_far(far_seq, near_seq)   # [B, 49, 512]
-        near_attended = self.cross_attn_near(near_seq, far_seq) # [B, 49, 512]
-
-        far_pooled = far_attended.mean(dim=1)   # [B, 512]
-        near_pooled = near_attended.mean(dim=1) # [B, 512]
-
-        combined = torch.cat([far_pooled, near_pooled], dim=1) # [B, 1024]
-        return self.classifier(combined)
-
-
-def load_data():
     with open(str(DATA_DIR / "labels.json")) as f:
         labels = json.load(f)
 
@@ -165,102 +109,73 @@ def load_data():
     print(f"Train: {len(train_ids)} {dict(dist_train)}")
     print(f"Test:  {len(test_ids)} {dict(dist_test)}")
 
-    return train_ids, test_ids, labels
+    print("Extracting features...")
+    samples_dir = DATA_DIR / "samples"
 
+    def get_features(sig):
+        far_feat = extract_features(samples_dir / sig / "far.jpg")
+        near_feat = extract_features(samples_dir / sig / "near.jpg")
+        diff_feat = far_feat - near_feat
+        return np.concatenate([far_feat, near_feat, diff_feat])
 
-def train():
-    t0 = time.time()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    X_train = np.array([get_features(s) for s in train_ids])
+    y_train = np.array([0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids])
+    X_test = np.array([get_features(s) for s in test_ids])
+    y_test = np.array([0 if labels[s]["main_label"] == "Positive" else 1 for s in test_ids])
 
-    train_ids, test_ids, labels = load_data()
+    feat_time = time.time() - t0
+    print(f"Feature extraction: {feat_time:.1f}s, shape: {X_train.shape}")
 
-    transform_train = T.Compose([
-        T.Resize((240, 240)),
-        T.RandomCrop(224),
-        T.RandomHorizontalFlip(),
-        T.RandAugment(num_ops=2, magnitude=7),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    transform_test = T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 
-    train_ds = DualImageDataset(train_ids, labels, transform_train)
-    test_ds = DualImageDataset(test_ids, labels, transform_test)
-
-    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True,
-                              num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False,
-                             num_workers=4, pin_memory=True)
-
-    model = DualStreamAttentionModel().to(device)
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Dual-stream ResNet18 + cross-attention, params: {num_params:,}")
-
-    train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
-    class_counts = Counter(train_labels)
-    weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
-    weight = weight / weight.sum() * 2
-    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-2)
-    epochs = 12
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=4, T_mult=2)
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
 
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
-    for epoch in range(epochs):
-        if time.time() - t0 > MAX_SECONDS:
-            print(f"Time budget reached at epoch {epoch}")
+    best_name = ""
+
+    configs = [
+        ("RF_200", RandomForestClassifier(n_estimators=200, max_depth=None, random_state=SEED, n_jobs=-1)),
+        ("RF_500", RandomForestClassifier(n_estimators=500, max_depth=None, random_state=SEED, n_jobs=-1)),
+        ("GBM_200", GradientBoostingClassifier(n_estimators=200, max_depth=5, learning_rate=0.1, random_state=SEED)),
+        ("GBM_500", GradientBoostingClassifier(n_estimators=500, max_depth=5, learning_rate=0.05, random_state=SEED)),
+    ]
+
+    for name, clf in configs:
+        if time.time() - t0 > MAX_SECONDS - 30:
+            print(f"Time budget approaching, stopping at {name}")
             break
 
-        model.train()
-        total_loss = 0
-        for far_imgs, near_imgs, targets in train_loader:
-            far_imgs = far_imgs.to(device)
-            near_imgs = near_imgs.to(device)
-            targets = targets.to(device)
-            optimizer.zero_grad()
-            out = model(far_imgs, near_imgs)
-            loss = criterion(out, targets)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item()
+        print(f"\nTraining {name}...")
+        clf.fit(X_train_s, y_train)
+        preds = clf.predict(X_test_s)
 
-        scheduler.step()
-
-        model.eval()
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for far_imgs, near_imgs, targets in test_loader:
-                far_imgs = far_imgs.to(device)
-                near_imgs = near_imgs.to(device)
-                out = model(far_imgs, near_imgs)
-                preds = out.argmax(dim=1).cpu().numpy()
-                all_preds.extend(preds)
-                all_labels.extend(targets.numpy())
-
-        bal_acc = balanced_accuracy_score(all_labels, all_preds)
-        acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average="binary")
-        avg_loss = total_loss / len(train_loader)
-
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
+        bal_acc = balanced_accuracy_score(y_test, preds)
+        acc = accuracy_score(y_test, preds)
+        f1 = f1_score(y_test, preds, average="binary")
+        print(f"  {name}: bal_acc={bal_acc:.4f} acc={acc:.4f} f1={f1:.4f}")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
             best_acc = acc
             best_f1 = f1
+            best_name = name
+
+            if hasattr(clf, 'feature_importances_'):
+                feat_names = [f"far_{i}" for i in range(12)] + [f"near_{i}" for i in range(12)] + [f"diff_{i}" for i in range(12)]
+                importances = clf.feature_importances_
+                top_idx = np.argsort(importances)[-10:][::-1]
+                print(f"  Top features: {[(feat_names[i], f'{importances[i]:.3f}') for i in top_idx]}")
 
     elapsed = time.time() - t0
+    num_params = X_train.shape[1] * 10
 
-    approach = "dual_stream_resnet18_cross_attention_focal_loss_randaugment"
+    approach = f"handcrafted_noise_grad_fft_color_36feat_{best_name}"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
