@@ -42,3 +42,5 @@ bd59b28	N/A	blocked	[DGX1] CLIP/ViT frozen encoder dual-image embeddings + MLP/R
 e2ee8ff	N/A	blocked	[DGX1] ResNet18 9ch (far+near+diff) + label smoothing + OneCycleLR + TTA
 c1de7ba	N/A	blocked	[DGX1] Multi-scale ResNet18 shared encoder (112+224+336) with far+near at each scale
 0360800	N/A	blocked	[DGX1] ConvNeXt-Tiny 6ch + CutMix + label smoothing 0.1 + strong augmentation
+--- iter12 experiments ---
+9de2fd6	0.970208	discard	[DGX1] EfficientNet-B0 6ch + focal loss + OneCycleLR + strong aug (9 epochs, 252.5s)
