@@ -1,8 +1,7 @@
 """
-train.py — Liveness: EfficientNet-B0 dual-stream (separate far/near encoders, late fusion)
+train.py — Liveness: ResNet50 6ch + MixUp + OneCycleLR + label smoothing
 Best previous DGX1: 0.976659 (ResNet18 6ch baseline)
-Previous dual-stream (ResNet18): 0.969479 (worse - shared weights hurt)
-This: separate pretrained EfficientNet-B0 encoders for far and near, late fusion.
+ResNet50 has ~4x more parameters. With MixUp regularization, it shouldn't overfit.
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -32,7 +31,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
 
-class DualImageDataset(Dataset):
+class LivenessDataset(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
@@ -61,32 +60,24 @@ class DualImageDataset(Dataset):
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
-        return far_img, near_img, label
+        img = torch.cat([far_img, near_img], dim=0)
+        return img, label
 
 
-class DualEfficientNet(nn.Module):
-    def __init__(self, num_classes=2):
-        super().__init__()
-        self.far_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-        self.near_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+def mixup_data(x, y, alpha=0.2):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
 
-        far_feat_dim = self.far_encoder.classifier[1].in_features
-        self.far_encoder.classifier = nn.Identity()
-        self.near_encoder.classifier = nn.Identity()
 
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(far_feat_dim * 2, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, far, near):
-        far_feats = self.far_encoder(far)
-        near_feats = self.near_encoder(near)
-        fused = torch.cat([far_feats, near_feats], dim=1)
-        return self.classifier(fused)
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
 def load_data():
@@ -113,6 +104,21 @@ def load_data():
     return train_ids, test_ids, labels
 
 
+def build_model(num_classes=2):
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    old_conv = model.conv1
+    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    with torch.no_grad():
+        model.conv1.weight[:, :3] = old_conv.weight
+        model.conv1.weight[:, 3:] = old_conv.weight
+
+    model.fc = nn.Sequential(
+        nn.Dropout(0.4),
+        nn.Linear(model.fc.in_features, num_classes),
+    )
+    return model
+
+
 def train():
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -121,9 +127,10 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((240, 240)),
-        T.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        T.Resize((256, 256)),
+        T.RandomResizedCrop(224, scale=(0.75, 1.0)),
         T.RandomHorizontalFlip(),
+        T.RandomRotation(10),
         T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
@@ -134,38 +141,28 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = DualImageDataset(train_ids, labels, transform_train)
-    test_ds = DualImageDataset(test_ids, labels, transform_test)
+    train_ds = LivenessDataset(train_ids, labels, transform_train)
+    test_ds = LivenessDataset(test_ids, labels, transform_test)
 
     train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DualEfficientNet(num_classes=2).to(device)
+    model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Dual EfficientNet-B0, params: {num_params:,}")
+    print(f"Model: ResNet50 (6-ch), params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.05)
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
 
-    for param in model.far_encoder.features[:5].parameters():
-        param.requires_grad = False
-    for param in model.near_encoder.features[:5].parameters():
-        param.requires_grad = False
-
-    optimizer = torch.optim.AdamW([
-        {"params": model.far_encoder.features[5:].parameters(), "lr": 5e-5},
-        {"params": model.near_encoder.features[5:].parameters(), "lr": 5e-5},
-        {"params": model.classifier.parameters(), "lr": 2e-4},
-    ], weight_decay=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
 
     epochs = 12
-    total_steps = epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=[5e-5, 5e-5, 2e-4], epochs=epochs,
-        steps_per_epoch=len(train_loader), pct_start=0.2,
+        optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train_loader),
+        pct_start=0.2, anneal_strategy='cos',
     )
 
     best_bal_acc = 0
@@ -177,23 +174,16 @@ def train():
             print(f"Time budget reached at epoch {epoch}")
             break
 
-        if epoch == 3:
-            for param in model.far_encoder.features[:5].parameters():
-                param.requires_grad = True
-            for param in model.near_encoder.features[:5].parameters():
-                param.requires_grad = True
-            print("Unfroze early layers at epoch 3")
-
         model.train()
         total_loss = 0
-        for far_imgs, near_imgs, targets in train_loader:
-            far_imgs = far_imgs.to(device)
-            near_imgs = near_imgs.to(device)
-            targets = targets.to(device)
+        for imgs, targets in train_loader:
+            imgs, targets = imgs.to(device), targets.to(device)
+
+            mixed_imgs, targets_a, targets_b, lam = mixup_data(imgs, targets, alpha=0.3)
 
             optimizer.zero_grad()
-            out = model(far_imgs, near_imgs)
-            loss = criterion(out, targets)
+            out = model(mixed_imgs)
+            loss = mixup_criterion(criterion, out, targets_a, targets_b, lam)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -203,10 +193,9 @@ def train():
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for far_imgs, near_imgs, targets in test_loader:
-                far_imgs = far_imgs.to(device)
-                near_imgs = near_imgs.to(device)
-                out = model(far_imgs, near_imgs)
+            for imgs, targets in test_loader:
+                imgs = imgs.to(device)
+                out = model(imgs)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -224,7 +213,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "dual_efficientnet_b0_separate_encoders_late_fusion_gradual_unfreeze"
+    approach = "resnet50_6ch_mixup03_labelsmooth01_dropout04_onecycleLR"
 
     result_block = (
         f"\n---\n"
