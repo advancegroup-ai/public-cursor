@@ -1,8 +1,8 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: Hybrid ResNet18 deep features + handcrafted noise/freq/gradient features fusion
-Key insight: handcrafted noise features (Laplacian variance) were perfect on smaller dataset,
-             fusing them with deep features should give the best of both worlds.
+Experiment: ResNet50 6ch + Adam lr=5e-5 + cosine + 20 epochs + label smoothing 0.05 + gradient accumulation
+Goal: Beat previous best of 0.9799 (ResNet50, Adam lr=1e-4, cosine, 15 epochs)
+Strategy: Lower LR, more epochs, slight label smoothing, gradient accumulation for effective larger batch
 """
 import os
 import sys
@@ -34,50 +34,11 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
-def extract_handcrafted_features(img_pil):
-    """Extract noise, gradient, and frequency features from a PIL image."""
-    img_np = np.array(img_pil.convert("L")).astype(np.float32)
-
-    # Laplacian variance (noise estimation)
-    from scipy.ndimage import laplace
-    lap = laplace(img_np)
-    noise_var = np.var(lap)
-    noise_mean = np.abs(lap).mean()
-
-    # Gradient magnitude (Sobel-like)
-    gy = np.diff(img_np, axis=0)
-    gx = np.diff(img_np, axis=1)
-    grad_mean = (np.abs(gy).mean() + np.abs(gx).mean()) / 2.0
-    grad_std = (np.std(gy) + np.std(gx)) / 2.0
-
-    # FFT high-frequency ratio
-    fft = np.fft.fft2(img_np)
-    fft_shift = np.fft.fftshift(fft)
-    mag = np.abs(fft_shift)
-    h, w = mag.shape
-    cy, cx = h // 2, w // 2
-    r = min(h, w) // 8
-    center_mask = np.zeros_like(mag, dtype=bool)
-    Y, X = np.ogrid[:h, :w]
-    center_mask[(Y - cy)**2 + (X - cx)**2 <= r**2] = True
-    low_energy = mag[center_mask].sum()
-    total_energy = mag.sum() + 1e-10
-    hf_ratio = 1.0 - low_energy / total_energy
-
-    # Color features from RGB
-    img_rgb = np.array(img_pil.convert("RGB")).astype(np.float32)
-    channel_means = img_rgb.mean(axis=(0, 1))
-    blue_shift = channel_means[2] - (channel_means[0] + channel_means[1]) / 2.0
-
-    return np.array([noise_var, noise_mean, grad_mean, grad_std, hf_ratio, blue_shift], dtype=np.float32)
-
-
-class HybridLivenessDataset(Dataset):
-    def __init__(self, sig_ids, labels, transform=None, img_size=224):
+class LivenessDataset(Dataset):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
         self.transform = transform
-        self.img_size = img_size
         self.samples_dir = DATA_DIR / "samples"
 
     def __len__(self):
@@ -95,59 +56,15 @@ class HybridLivenessDataset(Dataset):
             far_img = Image.open(str(far_path)).convert("RGB")
             near_img = Image.open(str(near_path)).convert("RGB")
         except Exception:
-            far_img = Image.new("RGB", (self.img_size, self.img_size))
-            near_img = Image.new("RGB", (self.img_size, self.img_size))
-
-        # Handcrafted features (computed before transform)
-        far_feats = extract_handcrafted_features(far_img)
-        near_feats = extract_handcrafted_features(near_img)
-        hand_feats = np.concatenate([far_feats, near_feats])  # 12 features
+            far_img = Image.new("RGB", (224, 224))
+            near_img = Image.new("RGB", (224, 224))
 
         if self.transform:
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
         img = torch.cat([far_img, near_img], dim=0)
-        hand_feats_tensor = torch.from_numpy(hand_feats).float()
-
-        return img, hand_feats_tensor, label
-
-
-class HybridModel(nn.Module):
-    def __init__(self, num_handcrafted=12, num_classes=2):
-        super().__init__()
-        backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-
-        old_conv = backbone.conv1
-        backbone.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        with torch.no_grad():
-            backbone.conv1.weight[:, :3] = old_conv.weight
-            backbone.conv1.weight[:, 3:] = old_conv.weight
-
-        self.features = nn.Sequential(*list(backbone.children())[:-1])  # up to avgpool
-        deep_dim = backbone.fc.in_features  # 512
-
-        self.hand_proj = nn.Sequential(
-            nn.Linear(num_handcrafted, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(deep_dim + 64, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, img, hand_feats):
-        deep = self.features(img).flatten(1)
-        hand = self.hand_proj(hand_feats)
-        fused = torch.cat([deep, hand], dim=1)
-        return self.classifier(fused)
+        return img, label
 
 
 def load_data():
@@ -174,16 +91,39 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+def build_model(num_classes=2):
+    """ResNet50 pretrained, modified for 6-channel input (far+near concat)."""
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
 
-    def forward(self, inputs, targets):
-        ce = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
-        pt = torch.exp(-ce)
-        loss = ((1 - pt) ** self.gamma) * ce
+    old_conv = model.conv1
+    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    with torch.no_grad():
+        model.conv1.weight[:, :3] = old_conv.weight
+        model.conv1.weight[:, 3:] = old_conv.weight
+
+    model.fc = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(model.fc.in_features, num_classes),
+    )
+    return model
+
+
+class LabelSmoothingCE(nn.Module):
+    def __init__(self, smoothing=0.05, weight=None):
+        super().__init__()
+        self.smoothing = smoothing
+        self.weight = weight
+
+    def forward(self, pred, target):
+        n_classes = pred.size(1)
+        one_hot = torch.zeros_like(pred).scatter(1, target.unsqueeze(1), 1)
+        one_hot = one_hot * (1 - self.smoothing) + self.smoothing / n_classes
+        log_probs = F.log_softmax(pred, dim=1)
+        if self.weight is not None:
+            w = self.weight[target].unsqueeze(1)
+            loss = -(one_hot * log_probs * w).sum(dim=1)
+        else:
+            loss = -(one_hot * log_probs).sum(dim=1)
         return loss.mean()
 
 
@@ -198,7 +138,8 @@ def train():
         T.Resize((256, 256)),
         T.RandomCrop(224),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+        T.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -208,28 +149,27 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = HybridLivenessDataset(train_ids, labels, transform_train)
-    test_ds = HybridLivenessDataset(test_ids, labels, transform_test)
+    train_ds = LivenessDataset(train_ids, labels, transform_train)
+    test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+    batch_size = 24
+    accum_steps = 2  # effective batch size = 48
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = HybridModel(num_handcrafted=12, num_classes=2).to(device)
+    model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Hybrid ResNet18 + handcrafted (noise/grad/FFT/color) fusion, params: {num_params:,}")
+    print(f"Model: ResNet50 (6-ch) + label smoothing + grad accum, params: {num_params:,}")
 
-    train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
-    class_counts = Counter(train_labels)
+    train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
+    class_counts = Counter(train_labels_list)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
+    criterion = LabelSmoothingCE(smoothing=0.05, weight=weight.to(device))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
-    epochs = 15
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=1e-3, steps_per_epoch=len(train_loader), epochs=epochs,
-        pct_start=0.2, div_factor=10, final_div_factor=100
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-4)
+    epochs = 20
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     best_bal_acc = 0
     best_acc = 0
@@ -241,27 +181,28 @@ def train():
 
         model.train()
         total_loss = 0
-        for imgs, hand_feats, targets in train_loader:
-            imgs = imgs.to(device)
-            hand_feats = hand_feats.to(device)
-            targets = targets.to(device)
-
-            optimizer.zero_grad()
-            out = model(imgs, hand_feats)
-            loss = criterion(out, targets)
+        optimizer.zero_grad()
+        for batch_idx, (imgs, targets) in enumerate(train_loader):
+            imgs, targets = imgs.to(device), targets.to(device)
+            out = model(imgs)
+            loss = criterion(out, targets) / accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            total_loss += loss.item()
+
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * accum_steps
+
+        scheduler.step()
 
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for imgs, hand_feats, targets in test_loader:
+            for imgs, targets in test_loader:
                 imgs = imgs.to(device)
-                hand_feats = hand_feats.to(device)
-                out = model(imgs, hand_feats)
+                out = model(imgs)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -271,7 +212,7 @@ def train():
         f1 = f1_score(all_labels, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
 
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} lr={scheduler.get_last_lr()[0]:.6f}")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
@@ -279,7 +220,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "hybrid_resnet18_handcrafted_noise_grad_fft_color_fusion"
+    approach = "resnet50_6ch_adam_5e5_cosine_20ep_labelsmooth_gradaccum"
 
     result_block = (
         f"\n---\n"
