@@ -1,9 +1,9 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
 
-Experiment: EfficientNet-B0 6-channel pretrained with AdamW + OneCycleLR + strong aug.
-Different backbone than ResNet18 baseline. EfficientNet-B0 is more parameter-efficient
-and may generalize better with fewer samples.
+Experiment: ResNet18 6ch + Focal Loss + MixUp + label smoothing.
+Focal loss helps with hard examples, MixUp regularization improves generalization,
+label smoothing prevents overconfident predictions.
 """
 import os
 import sys
@@ -56,6 +56,32 @@ def load_labels():
         with open(str(DATA_DIR / "labels.json")) as f:
             labels = json.load(f)
     return labels
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.05):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        num_classes = inputs.size(1)
+        smooth_targets = torch.zeros_like(inputs)
+        smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0)
+        smooth_targets = smooth_targets * (1 - self.label_smoothing) + self.label_smoothing / num_classes
+
+        log_probs = F.log_softmax(inputs, dim=1)
+        probs = torch.exp(log_probs)
+
+        focal_weight = (1 - probs) ** self.gamma
+        loss = -focal_weight * smooth_targets * log_probs
+
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets].unsqueeze(1)
+            loss = alpha_t * loss
+
+        return loss.sum(dim=1).mean()
 
 
 class LivenessDataset(Dataset):
@@ -119,22 +145,31 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-def build_efficientnet_6ch(num_classes=2):
-    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-
-    old_conv = model.features[0][0]
-    new_conv = nn.Conv2d(6, 32, kernel_size=3, stride=2, padding=1, bias=False)
+def build_model(num_classes=2):
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    old_conv = model.conv1
+    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
     with torch.no_grad():
-        new_conv.weight[:, :3] = old_conv.weight
-        new_conv.weight[:, 3:] = old_conv.weight
-    model.features[0][0] = new_conv
+        model.conv1.weight[:, :3] = old_conv.weight
+        model.conv1.weight[:, 3:] = old_conv.weight
 
-    in_features = model.classifier[1].in_features
-    model.classifier = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(in_features, num_classes),
+    model.fc = nn.Sequential(
+        nn.Dropout(0.4),
+        nn.Linear(model.fc.in_features, num_classes),
     )
     return model
+
+
+def mixup_data(x, y, alpha=0.3):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
 
 
 def train():
@@ -149,12 +184,10 @@ def train():
     transform_train = T.Compose([
         T.Resize((224, 224)),
         T.RandomHorizontalFlip(),
-        T.RandomRotation(15),
-        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
-        T.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        T.RandomRotation(10),
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        T.RandomErasing(p=0.2),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -168,20 +201,20 @@ def train():
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = build_efficientnet_6ch().to(device)
+    model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: EfficientNet-B0 (6ch), params: {num_params:,}")
+    print(f"Model: ResNet18 (6ch) + FocalLoss + MixUp, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
-    weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
-    weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    alpha = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
+    alpha = alpha / alpha.sum() * 2
+    criterion = FocalLoss(alpha=alpha.to(device), gamma=2.0, label_smoothing=0.05)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
-    epochs = 15
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-4)
+    epochs = 20
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=5e-4, epochs=epochs, steps_per_epoch=len(train_loader)
+        optimizer, max_lr=3e-4, epochs=epochs, steps_per_epoch=len(train_loader)
     )
 
     best_bal_acc = 0
@@ -196,9 +229,12 @@ def train():
         total_loss = 0
         for imgs, targets in train_loader:
             imgs, targets = imgs.to(device), targets.to(device)
+
+            mixed_imgs, y_a, y_b, lam = mixup_data(imgs, targets, alpha=0.3)
+
             optimizer.zero_grad()
-            out = model(imgs)
-            loss = criterion(out, targets)
+            out = model(mixed_imgs)
+            loss = lam * criterion(out, y_a) + (1 - lam) * criterion(out, y_b)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -228,7 +264,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "efficientnet_b0_6ch_adamw_onecyclelr_strong_aug"
+    approach = "resnet18_6ch_focal_loss_mixup_label_smoothing"
 
     print(f"\n---")
     print(f"balanced_accuracy: {best_bal_acc:.6f}")
