@@ -1,7 +1,8 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
 
-Experiment: ResNet18 + FocalLoss + strong augmentation + cosine warmup + mixup
+Experiment: ResNet18 + FocalLoss + stronger augmentation + cosine warmup + dropout
+Best baseline so far: 0.976659 (ResNet18 6ch, Adam lr=1e-4, 15 epochs)
 """
 import os
 import sys
@@ -48,43 +49,36 @@ class FocalLoss(nn.Module):
 
 
 class LivenessDataset(Dataset):
-    def __init__(self, sig_ids, labels, transform=None, mixup_alpha=0.0):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
         self.transform = transform
-        self.mixup_alpha = mixup_alpha
         self.samples_dir = DATA_DIR / "samples"
 
     def __len__(self):
         return len(self.sig_ids)
 
-    def _load_pair(self, idx):
+    def __getitem__(self, idx):
         sig = self.sig_ids[idx]
         info = self.labels[sig]
         label = 0 if info["main_label"] == "Positive" else 1
+
         far_path = self.samples_dir / sig / "far.jpg"
         near_path = self.samples_dir / sig / "near.jpg"
+
         try:
             far_img = Image.open(str(far_path)).convert("RGB")
             near_img = Image.open(str(near_path)).convert("RGB")
         except Exception:
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
+
         if self.transform:
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
+
         img = torch.cat([far_img, near_img], dim=0)
         return img, label
-
-    def __getitem__(self, idx):
-        img, label = self._load_pair(idx)
-        if self.mixup_alpha > 0 and random.random() < 0.5:
-            idx2 = random.randint(0, len(self) - 1)
-            img2, label2 = self._load_pair(idx2)
-            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
-            img = lam * img + (1 - lam) * img2
-            return img, label, label2, lam
-        return img, label, label, 1.0
 
 
 def load_data():
@@ -111,15 +105,17 @@ def load_data():
 
 
 def build_model(num_classes=2):
+    """ResNet18 pretrained, 6-channel input, with dropout before FC."""
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     old_conv = model.conv1
     model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
     with torch.no_grad():
         model.conv1.weight[:, :3] = old_conv.weight
         model.conv1.weight[:, 3:] = old_conv.weight
+    in_features = model.fc.in_features
     model.fc = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(model.fc.in_features, num_classes)
+        nn.Dropout(0.4),
+        nn.Linear(in_features, num_classes)
     )
     return model
 
@@ -144,13 +140,12 @@ def train():
         T.Resize((256, 256)),
         T.RandomCrop(224),
         T.RandomHorizontalFlip(),
-        T.RandomVerticalFlip(p=0.1),
         T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
         T.RandomGrayscale(p=0.05),
-        T.RandomRotation(15),
+        T.RandomRotation(10),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        T.RandomErasing(p=0.2),
+        T.RandomErasing(p=0.15),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -158,18 +153,18 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = LivenessDataset(train_ids, labels, transform_train, mixup_alpha=0.4)
-    test_ds = LivenessDataset(test_ids, labels, transform_test, mixup_alpha=0.0)
+    train_ds = LivenessDataset(train_ids, labels, transform_train)
+    test_ds = LivenessDataset(test_ids, labels, transform_test)
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
     model = build_model().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 6ch + FocalLoss + Mixup + StrongAug, params: {num_params:,}")
+    print(f"Model: ResNet18 6ch + FocalLoss + StrongAug + Warmup, params: {num_params:,}")
 
-    train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
-    class_counts = Counter(train_labels)
+    train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
+    class_counts = Counter(train_labels_list)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
     criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
@@ -193,17 +188,11 @@ def train():
 
         model.train()
         total_loss = 0
-        for batch in train_loader:
-            imgs, labels1, labels2, lam = batch
-            imgs = imgs.to(device)
-            labels1 = labels1.to(device)
-            labels2 = labels2.to(device)
-            lam_t = lam.float().to(device) if isinstance(lam, torch.Tensor) else torch.tensor(lam, device=device).float()
-
+        for imgs, targets in train_loader:
+            imgs, targets = imgs.to(device), targets.to(device)
             optimizer.zero_grad()
             out = model(imgs)
-            loss = lam_t.mean() * F.cross_entropy(out, labels1, weight=weight.to(device)) + \
-                   (1 - lam_t.mean()) * F.cross_entropy(out, labels2, weight=weight.to(device))
+            loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -213,13 +202,12 @@ def train():
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for batch in test_loader:
-                imgs, labels1, labels2, lam = batch
+            for imgs, targets in test_loader:
                 imgs = imgs.to(device)
                 out = model(imgs)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
-                all_labels.extend(labels1.numpy())
+                all_labels.extend(targets.numpy())
 
         bal_acc = balanced_accuracy_score(all_labels, all_preds)
         acc = accuracy_score(all_labels, all_preds)
@@ -235,7 +223,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "resnet18_6ch_focalloss_mixup_strongaug_cosine_warmup"
+    approach = "resnet18_6ch_focal_loss_strong_aug_cosine_warmup_dropout04"
 
     result_block = (
         f"\n---\n"
