@@ -1,8 +1,8 @@
 """
-train.py — Liveness detection: Dual-stream ResNet18 shared encoder + cross-attention fusion + TTA
-Key innovation: cross-attention between far and near feature maps before pooling.
-This lets the model learn what spatial regions in one image are informative 
-given the other image's context (e.g., matching face regions, detecting artifacts).
+train.py — Liveness detection: Triple-stream (far + near + difference) ResNet18 shared encoder + TTA
+Key innovation: A 3rd stream processes the absolute difference between far and near images.
+The difference highlights inconsistencies between the two shots that may indicate
+spoofing (e.g., identical texture from screens, artifacts from deepfakes).
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -31,11 +31,12 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
-class LivenessDatasetDual(Dataset):
-    def __init__(self, sig_ids, labels, transform=None):
+class LivenessDatasetTriple(Dataset):
+    def __init__(self, sig_ids, labels, transform=None, diff_transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
         self.transform = transform
+        self.diff_transform = diff_transform or transform
         self.samples_dir = DATA_DIR / "samples"
 
     def __len__(self):
@@ -53,10 +54,27 @@ class LivenessDatasetDual(Dataset):
         except Exception:
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
+
+        far_resized = far_img.resize((224, 224))
+        near_resized = near_img.resize((224, 224))
+        far_np = np.array(far_resized, dtype=np.float32)
+        near_np = np.array(near_resized, dtype=np.float32)
+        diff_np = np.abs(far_np - near_np).clip(0, 255).astype(np.uint8)
+        diff_img = Image.fromarray(diff_np, mode="RGB")
+
         if self.transform:
-            far_img = self.transform(far_img)
-            near_img = self.transform(near_img)
-        return far_img, near_img, label
+            far_t = self.transform(far_img)
+            near_t = self.transform(near_img)
+        else:
+            far_t = T.ToTensor()(far_img)
+            near_t = T.ToTensor()(near_img)
+
+        if self.diff_transform:
+            diff_t = self.diff_transform(diff_img)
+        else:
+            diff_t = T.ToTensor()(diff_img)
+
+        return far_t, near_t, diff_t, label
 
 
 def load_data():
@@ -90,74 +108,36 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class CrossAttention(nn.Module):
-    """Lightweight cross-attention between two feature maps."""
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-
-    def forward(self, x, context):
-        B, N, C = x.shape
-        q = self.q_proj(self.norm1(x)).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = self.k_proj(self.norm2(context)).reshape(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        v = self.v_proj(context).reshape(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        return x + self.out_proj(out)
-
-
-class DualStreamCrossAttention(nn.Module):
-    """Shared ResNet18 backbone + cross-attention between far/near feature maps."""
+class TripleStreamResNet(nn.Module):
+    """Shared ResNet18 encoder for far, near, and difference images."""
     def __init__(self, num_classes=2):
         super().__init__()
         base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        layers = list(base.children())
-        self.backbone = nn.Sequential(*layers[:-2])  # up to layer4 (7x7x512)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-
+        self.encoder = nn.Sequential(*list(base.children())[:-1])
         feat_dim = 512
-        self.cross_attn_far = CrossAttention(feat_dim, num_heads=4)
-        self.cross_attn_near = CrossAttention(feat_dim, num_heads=4)
+
+        self.gate = nn.Sequential(
+            nn.Linear(feat_dim * 3, feat_dim * 3),
+            nn.Sigmoid(),
+        )
 
         self.classifier = nn.Sequential(
-            nn.BatchNorm1d(feat_dim * 2),
+            nn.BatchNorm1d(feat_dim * 3),
             nn.Dropout(0.3),
-            nn.Linear(feat_dim * 2, 256),
+            nn.Linear(feat_dim * 3, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(256, num_classes),
         )
 
-    def forward(self, far, near):
-        # Extract spatial feature maps
-        f_far = self.backbone(far)    # (B, 512, 7, 7)
-        f_near = self.backbone(near)  # (B, 512, 7, 7)
-
-        B, C, H, W = f_far.shape
-        far_tokens = f_far.flatten(2).permute(0, 2, 1)   # (B, 49, 512)
-        near_tokens = f_near.flatten(2).permute(0, 2, 1)  # (B, 49, 512)
-
-        far_attended = self.cross_attn_far(far_tokens, near_tokens)   # (B, 49, 512)
-        near_attended = self.cross_attn_near(near_tokens, far_tokens)  # (B, 49, 512)
-
-        far_feat = far_attended.permute(0, 2, 1).reshape(B, C, H, W)
-        near_feat = near_attended.permute(0, 2, 1).reshape(B, C, H, W)
-
-        f_far_pooled = self.pool(far_feat).flatten(1)    # (B, 512)
-        f_near_pooled = self.pool(near_feat).flatten(1)   # (B, 512)
-
-        combined = torch.cat([f_far_pooled, f_near_pooled], dim=1)
-        return self.classifier(combined)
+    def forward(self, far, near, diff):
+        f_far = self.encoder(far).flatten(1)
+        f_near = self.encoder(near).flatten(1)
+        f_diff = self.encoder(diff).flatten(1)
+        combined = torch.cat([f_far, f_near, f_diff], dim=1)
+        gate_weights = self.gate(combined)
+        gated = combined * gate_weights
+        return self.classifier(gated)
 
 
 class FocalLoss(nn.Module):
@@ -193,15 +173,15 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = LivenessDatasetDual(train_ids, labels, transform_train)
-    test_ds = LivenessDatasetDual(test_ids, labels, transform_test)
+    train_ds = LivenessDatasetTriple(train_ids, labels, transform_train, transform_train)
+    test_ds = LivenessDatasetTriple(test_ids, labels, transform_test, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DualStreamCrossAttention().to(device)
+    model = TripleStreamResNet().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Dual-stream ResNet18 + Cross-Attention, params: {num_params:,}")
+    print(f"Model: Triple-stream ResNet18 shared (far+near+diff) + gated fusion, params: {num_params:,}")
 
     train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels_list)
@@ -209,15 +189,9 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = FocalLoss(alpha=weight.to(device), gamma=1.5)
 
-    # Differential LR: lower for backbone, higher for cross-attn + classifier
-    backbone_params = list(model.backbone.parameters())
-    head_params = list(model.cross_attn_far.parameters()) + list(model.cross_attn_near.parameters()) + list(model.classifier.parameters())
-    optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': 5e-5},
-        {'params': head_params, 'lr': 2e-4},
-    ], weight_decay=1e-3)
-
     epochs = 12
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+
     total_steps = epochs * len(train_loader)
     warmup_steps = len(train_loader)
 
@@ -240,10 +214,11 @@ def train():
 
         model.train()
         total_loss = 0
-        for far, near, targets in train_loader:
-            far, near, targets = far.to(device), near.to(device), targets.to(device)
+        for far, near, diff, targets in train_loader:
+            far, near, diff = far.to(device), near.to(device), diff.to(device)
+            targets = targets.to(device)
             optimizer.zero_grad()
-            out = model(far, near)
+            out = model(far, near, diff)
             loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -251,14 +226,17 @@ def train():
             scheduler.step()
             total_loss += loss.item()
 
-        # Eval with TTA
         model.eval()
         all_preds, all_labels_list = [], []
         with torch.no_grad():
-            for far, near, targets in test_loader:
-                far, near = far.to(device), near.to(device)
-                out1 = model(far, near)
-                out2 = model(torch.flip(far, dims=[3]), torch.flip(near, dims=[3]))
+            for far, near, diff, targets in test_loader:
+                far, near, diff = far.to(device), near.to(device), diff.to(device)
+                out1 = model(far, near, diff)
+                out2 = model(
+                    torch.flip(far, dims=[3]),
+                    torch.flip(near, dims=[3]),
+                    torch.flip(diff, dims=[3]),
+                )
                 out = (out1 + out2) / 2.0
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
@@ -276,7 +254,7 @@ def train():
             best_f1 = f1v
 
     elapsed = time.time() - t0
-    approach = "dual_stream_resnet18_shared_cross_attention_focal_diff_LR_TTA"
+    approach = "triple_stream_resnet18_shared_far_near_diff_gated_fusion_focal_TTA"
 
     result_block = (
         f"\n---\n"
