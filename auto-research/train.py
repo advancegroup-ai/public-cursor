@@ -1,11 +1,10 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
 
-Experiment: ViT-B/16 pretrained with dual-image input via patch embedding modification.
-Previous best: 0.976659 (ResNet18 6ch baseline)
-Vision Transformers capture global context via self-attention, which may help
-detect holistic patterns (screen edges, moire, inconsistent lighting) in liveness.
-We process far and near as separate image tokens concatenated in sequence.
+Experiment: Dual-stream ResNet18 with cross-attention fusion + focal loss + 
+stronger training regime. Previous dual-stream (iter2) scored 0.969 with simple
+concat. This uses cross-attention between far and near feature maps, plus
+focal loss and stronger augmentation to beat the 0.9767 baseline.
 """
 import os
 import sys
@@ -36,6 +35,19 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
 
 
 class DualImageDataset(Dataset):
@@ -70,35 +82,65 @@ class DualImageDataset(Dataset):
         return far_img, near_img, label
 
 
-class DualViT(nn.Module):
-    """Use ViT-B/16 as shared encoder for both far and near images.
-    Pool both CLS tokens and classify from their concatenation."""
+class CrossAttentionFusion(nn.Module):
+    """Cross-attention between two feature maps."""
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
+
+    def forward(self, query, key_value):
+        attn_out, _ = self.attn(query, key_value, key_value)
+        x = self.norm1(query + attn_out)
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+
+class DualStreamAttentionModel(nn.Module):
     def __init__(self, num_classes=2):
         super().__init__()
-        self.vit = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
-        hidden_dim = self.vit.heads.head.in_features
-        self.vit.heads = nn.Identity()
+
+        far_backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        near_backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+        self.far_encoder = nn.Sequential(*list(far_backbone.children())[:-2])
+        self.near_encoder = nn.Sequential(*list(near_backbone.children())[:-2])
+
+        feat_dim = 512
+
+        self.cross_attn_far = CrossAttentionFusion(feat_dim, num_heads=4)
+        self.cross_attn_near = CrossAttentionFusion(feat_dim, num_heads=4)
+
+        self.pool = nn.AdaptiveAvgPool1d(1)
 
         self.classifier = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, 256),
-            nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Linear(feat_dim * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
             nn.Linear(256, num_classes),
         )
 
-        # Freeze early layers to speed up training
-        for name, param in self.vit.named_parameters():
-            if 'encoder.layers.encoder_layer_10' not in name and \
-               'encoder.layers.encoder_layer_11' not in name and \
-               'encoder.ln' not in name and \
-               'class_token' not in name:
-                param.requires_grad = False
-
     def forward(self, far_img, near_img):
-        far_feat = self.vit(far_img)
-        near_feat = self.vit(near_img)
-        combined = torch.cat([far_feat, near_feat], dim=1)
+        far_feat = self.far_encoder(far_img)   # [B, 512, 7, 7]
+        near_feat = self.near_encoder(near_img) # [B, 512, 7, 7]
+
+        B, C, H, W = far_feat.shape
+        far_seq = far_feat.flatten(2).permute(0, 2, 1)   # [B, 49, 512]
+        near_seq = near_feat.flatten(2).permute(0, 2, 1)  # [B, 49, 512]
+
+        far_attended = self.cross_attn_far(far_seq, near_seq)   # [B, 49, 512]
+        near_attended = self.cross_attn_near(near_seq, far_seq) # [B, 49, 512]
+
+        far_pooled = far_attended.mean(dim=1)   # [B, 512]
+        near_pooled = near_attended.mean(dim=1) # [B, 512]
+
+        combined = torch.cat([far_pooled, near_pooled], dim=1) # [B, 1024]
         return self.classifier(combined)
 
 
@@ -134,9 +176,10 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((240, 240)),
+        T.RandomCrop(224),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2),
+        T.RandAugment(num_ops=2, magnitude=7),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -149,28 +192,24 @@ def train():
     train_ds = DualImageDataset(train_ids, labels, transform_train)
     test_ds = DualImageDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True,
+    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True,
                               num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False,
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False,
                              num_workers=4, pin_memory=True)
 
-    model = DualViT().to(device)
+    model = DualStreamAttentionModel().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: Dual ViT-B/16 (shared encoder), trainable: {num_params:,}, total: {total_params:,}")
+    print(f"Model: Dual-stream ResNet18 + cross-attention, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=5e-5, weight_decay=1e-2,
-    )
-    epochs = 8
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-2)
+    epochs = 12
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=4, T_mult=2)
 
     best_bal_acc = 0
     best_acc = 0
@@ -221,7 +260,7 @@ def train():
 
     elapsed = time.time() - t0
 
-    approach = "dual_vit_b16_shared_encoder_finetuned_last2_layers"
+    approach = "dual_stream_resnet18_cross_attention_focal_loss_randaugment"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
