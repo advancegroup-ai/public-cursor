@@ -1,13 +1,9 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: ResNet18 6ch + Focal Loss + MixUp + CosineWarmup + Strong Aug + Stratified Split
-Key changes vs baseline (0.976659):
-- Focal loss (gamma=2) for hard example mining
-- MixUp augmentation (alpha=0.3)
-- Cosine annealing with warmup (3 epochs warmup)
-- Stronger augmentation: RandomResizedCrop, ColorJitter, RandomErasing
-- Stratified train/test split for more reliable evaluation
-- Gradient clipping
+Experiment: Dual-stream ResNet18 with cross-attention fusion.
+Key idea: separate encoders for far and near images, then cross-attention
+to learn relationships between the two views before classification.
+Previous best: 0.976659 (ResNet18 6ch baseline).
 """
 import os
 import sys
@@ -41,25 +37,60 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None):
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, dim=512, num_heads=4):
         super().__init__()
-        self.gamma = gamma
-        self.weight = weight
+        self.attn_far_to_near = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.attn_near_to_far = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
 
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        return focal_loss.mean()
+    def forward(self, far_feat, near_feat):
+        far_q = far_feat.unsqueeze(1)
+        near_q = near_feat.unsqueeze(1)
+        attended_far, _ = self.attn_far_to_near(far_q, near_q, near_q)
+        attended_near, _ = self.attn_near_to_far(near_q, far_q, far_q)
+        far_out = self.norm1(far_feat + attended_far.squeeze(1))
+        near_out = self.norm2(near_feat + attended_near.squeeze(1))
+        return far_out, near_out
+
+
+class DualStreamCrossAttention(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        feat_dim = base.fc.in_features
+
+        self.far_encoder = nn.Sequential(*list(base.children())[:-1])
+        base2 = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.near_encoder = nn.Sequential(*list(base2.children())[:-1])
+
+        self.cross_attn = CrossAttentionFusion(dim=feat_dim, num_heads=4)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(feat_dim * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        far = x[:, :3]
+        near = x[:, 3:]
+
+        far_feat = self.far_encoder(far).squeeze(-1).squeeze(-1)
+        near_feat = self.near_encoder(near).squeeze(-1).squeeze(-1)
+
+        far_att, near_att = self.cross_attn(far_feat, near_feat)
+        fused = torch.cat([far_att, near_att], dim=1)
+        return self.classifier(fused)
 
 
 class LivenessDataset(Dataset):
-    def __init__(self, sig_ids, labels, transform=None, mixup_alpha=0.0):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
         self.transform = transform
-        self.mixup_alpha = mixup_alpha
         self.samples_dir = DATA_DIR / "samples"
 
     def __len__(self):
@@ -88,31 +119,6 @@ class LivenessDataset(Dataset):
         return img, label
 
 
-def mixup_data(x, y, alpha=0.3):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1.0
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size, device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[index]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
-
-def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return max(min_lr / optimizer.defaults['lr'], 0.5 * (1.0 + math.cos(math.pi * progress)))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
 def load_data():
     with open(str(DATA_DIR / "labels.json")) as f:
         labels = json.load(f)
@@ -139,19 +145,13 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-def build_model(num_classes=2):
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-    old_conv = model.conv1
-    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    with torch.no_grad():
-        model.conv1.weight[:, :3] = old_conv.weight
-        model.conv1.weight[:, 3:] = old_conv.weight
-
-    model.fc = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(model.fc.in_features, num_classes)
-    )
-    return model
+def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs):
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return max(1e-6 / optimizer.defaults['lr'], 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def train():
@@ -162,14 +162,12 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.RandomResizedCrop(224, scale=(0.7, 1.0)),
+        T.RandomResizedCrop(224, scale=(0.8, 1.0)),
         T.RandomHorizontalFlip(),
-        T.RandomVerticalFlip(p=0.1),
-        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
-        T.RandomGrayscale(p=0.05),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        T.RandomErasing(p=0.2, scale=(0.02, 0.15)),
+        T.RandomErasing(p=0.15),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -183,19 +181,19 @@ def train():
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = build_model().to(device)
+    model = DualStreamCrossAttention().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 6ch + FocalLoss + MixUp + CosineWarmup, params: {num_params:,}")
+    print(f"Model: Dual-stream ResNet18 + CrossAttention, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = FocalLoss(gamma=2.0, weight=weight.to(device))
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.05)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
-    epochs = 20
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_epochs=3, total_epochs=epochs)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
+    epochs = 15
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_epochs=2, total_epochs=epochs)
 
     best_bal_acc = 0
     best_acc = 0
@@ -210,10 +208,9 @@ def train():
         total_loss = 0
         for imgs, targets in train_loader:
             imgs, targets = imgs.to(device), targets.to(device)
-            mixed_imgs, targets_a, targets_b, lam = mixup_data(imgs, targets, alpha=0.3)
             optimizer.zero_grad()
-            out = model(mixed_imgs)
-            loss = mixup_criterion(criterion, out, targets_a, targets_b, lam)
+            out = model(imgs)
+            loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -245,7 +242,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "resnet18_6ch_focal_mixup_cosine_warmup_strong_aug_stratified"
+    approach = "dual_stream_resnet18_cross_attention_fusion_label_smoothing"
 
     result_block = (
         f"\n---\n"
