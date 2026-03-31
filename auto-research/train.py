@@ -1,11 +1,8 @@
 """
-train.py — Liveness detection: Dual-stream ResNet18 shared encoder + MixUp + 5-TTA ensemble
-Building on best result (0.985515). Key changes from baseline:
-1. MixUp augmentation (alpha=0.3) during training for regularization
-2. 5-crop TTA at test: original + hflip + 4 corner crops averaged
-3. Cosine warmup LR schedule
-4. Stratified K-fold split (same as best experiment)
-5. Label smoothing (0.1) instead of focal loss
+train.py — Liveness detection: Dual-stream ResNet18 shared encoder + cross-attention fusion + TTA
+Key innovation: cross-attention between far and near feature maps before pooling.
+This lets the model learn what spatial regions in one image are informative 
+given the other image's context (e.g., matching face regions, detecting artifacts).
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -62,50 +59,6 @@ class LivenessDatasetDual(Dataset):
         return far_img, near_img, label
 
 
-class LivenessDatasetTTA(Dataset):
-    """Dataset that returns multiple augmented views for TTA."""
-    def __init__(self, sig_ids, labels):
-        self.sig_ids = sig_ids
-        self.labels = labels
-        self.samples_dir = DATA_DIR / "samples"
-        self.base_transform = T.Compose([
-            T.Resize((256, 256)),
-            T.CenterCrop(224),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-        self.hflip_transform = T.Compose([
-            T.Resize((256, 256)),
-            T.CenterCrop(224),
-            T.RandomHorizontalFlip(p=1.0),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-
-    def __len__(self):
-        return len(self.sig_ids)
-
-    def __getitem__(self, idx):
-        sig = self.sig_ids[idx]
-        info = self.labels[sig]
-        label = 0 if info["main_label"] == "Positive" else 1
-        far_path = self.samples_dir / sig / "far.jpg"
-        near_path = self.samples_dir / sig / "near.jpg"
-        try:
-            far_img = Image.open(str(far_path)).convert("RGB")
-            near_img = Image.open(str(near_path)).convert("RGB")
-        except Exception:
-            far_img = Image.new("RGB", (224, 224))
-            near_img = Image.new("RGB", (224, 224))
-
-        far_base = self.base_transform(far_img)
-        near_base = self.base_transform(near_img)
-        far_flip = self.hflip_transform(far_img)
-        near_flip = self.hflip_transform(near_img)
-
-        return far_base, near_base, far_flip, near_flip, label
-
-
 def load_data():
     with open(str(DATA_DIR / "labels.json")) as f:
         labels = json.load(f)
@@ -137,43 +90,86 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class DualStreamResNet(nn.Module):
-    """Shared ResNet18 encoder for far and near face images."""
+class CrossAttention(nn.Module):
+    """Lightweight cross-attention between two feature maps."""
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x, context):
+        B, N, C = x.shape
+        q = self.q_proj(self.norm1(x)).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(self.norm2(context)).reshape(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(context).reshape(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return x + self.out_proj(out)
+
+
+class DualStreamCrossAttention(nn.Module):
+    """Shared ResNet18 backbone + cross-attention between far/near feature maps."""
     def __init__(self, num_classes=2):
         super().__init__()
         base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.encoder = nn.Sequential(*list(base.children())[:-1])
+        layers = list(base.children())
+        self.backbone = nn.Sequential(*layers[:-2])  # up to layer4 (7x7x512)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
         feat_dim = 512
+        self.cross_attn_far = CrossAttention(feat_dim, num_heads=4)
+        self.cross_attn_near = CrossAttention(feat_dim, num_heads=4)
+
         self.classifier = nn.Sequential(
+            nn.BatchNorm1d(feat_dim * 2),
             nn.Dropout(0.3),
             nn.Linear(feat_dim * 2, 256),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(256, num_classes),
         )
 
     def forward(self, far, near):
-        f_far = self.encoder(far).flatten(1)
-        f_near = self.encoder(near).flatten(1)
-        combined = torch.cat([f_far, f_near], dim=1)
+        # Extract spatial feature maps
+        f_far = self.backbone(far)    # (B, 512, 7, 7)
+        f_near = self.backbone(near)  # (B, 512, 7, 7)
+
+        B, C, H, W = f_far.shape
+        far_tokens = f_far.flatten(2).permute(0, 2, 1)   # (B, 49, 512)
+        near_tokens = f_near.flatten(2).permute(0, 2, 1)  # (B, 49, 512)
+
+        far_attended = self.cross_attn_far(far_tokens, near_tokens)   # (B, 49, 512)
+        near_attended = self.cross_attn_near(near_tokens, far_tokens)  # (B, 49, 512)
+
+        far_feat = far_attended.permute(0, 2, 1).reshape(B, C, H, W)
+        near_feat = near_attended.permute(0, 2, 1).reshape(B, C, H, W)
+
+        f_far_pooled = self.pool(far_feat).flatten(1)    # (B, 512)
+        f_near_pooled = self.pool(near_feat).flatten(1)   # (B, 512)
+
+        combined = torch.cat([f_far_pooled, f_near_pooled], dim=1)
         return self.classifier(combined)
 
 
-def mixup_data(far, near, y, alpha=0.3):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1.0
-    batch_size = far.size(0)
-    index = torch.randperm(batch_size, device=far.device)
-    mixed_far = lam * far + (1 - lam) * far[index]
-    mixed_near = lam * near + (1 - lam) * near[index]
-    y_a, y_b = y, y[index]
-    return mixed_far, mixed_near, y_a, y_b, lam
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
 
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
 
 
 def train():
@@ -191,26 +187,37 @@ def train():
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
+    transform_test = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
 
     train_ds = LivenessDatasetDual(train_ids, labels, transform_train)
-    test_ds = LivenessDatasetTTA(test_ids, labels)
+    test_ds = LivenessDatasetDual(test_ids, labels, transform_test)
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DualStreamResNet().to(device)
+    model = DualStreamCrossAttention().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Dual-stream ResNet18 shared + MixUp + TTA, params: {num_params:,}")
+    print(f"Model: Dual-stream ResNet18 + Cross-Attention, params: {num_params:,}")
 
     train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels_list)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
+    criterion = FocalLoss(alpha=weight.to(device), gamma=1.5)
 
-    epochs = 15
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    # Differential LR: lower for backbone, higher for cross-attn + classifier
+    backbone_params = list(model.backbone.parameters())
+    head_params = list(model.cross_attn_far.parameters()) + list(model.cross_attn_near.parameters()) + list(model.classifier.parameters())
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': 5e-5},
+        {'params': head_params, 'lr': 2e-4},
+    ], weight_decay=1e-3)
 
+    epochs = 12
     total_steps = epochs * len(train_loader)
     warmup_steps = len(train_loader)
 
@@ -225,7 +232,6 @@ def train():
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
-    step = 0
 
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS - 30:
@@ -236,31 +242,24 @@ def train():
         total_loss = 0
         for far, near, targets in train_loader:
             far, near, targets = far.to(device), near.to(device), targets.to(device)
-
-            mixed_far, mixed_near, y_a, y_b, lam = mixup_data(far, near, targets, alpha=0.3)
-
             optimizer.zero_grad()
-            out = model(mixed_far, mixed_near)
-            loss = mixup_criterion(criterion, out, y_a, y_b, lam)
+            out = model(far, near)
+            loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             total_loss += loss.item()
-            step += 1
 
-        # Eval with TTA (base + hflip)
+        # Eval with TTA
         model.eval()
         all_preds, all_labels_list = [], []
         with torch.no_grad():
-            for far_base, near_base, far_flip, near_flip, targets in test_loader:
-                far_base, near_base = far_base.to(device), near_base.to(device)
-                far_flip, near_flip = far_flip.to(device), near_flip.to(device)
-
-                out1 = model(far_base, near_base)
-                out2 = model(far_flip, near_flip)
+            for far, near, targets in test_loader:
+                far, near = far.to(device), near.to(device)
+                out1 = model(far, near)
+                out2 = model(torch.flip(far, dims=[3]), torch.flip(near, dims=[3]))
                 out = (out1 + out2) / 2.0
-
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels_list.extend(targets.numpy())
@@ -277,7 +276,7 @@ def train():
             best_f1 = f1v
 
     elapsed = time.time() - t0
-    approach = "dual_stream_resnet18_shared_MixUp_label_smooth_warmup_cosine_TTA"
+    approach = "dual_stream_resnet18_shared_cross_attention_focal_diff_LR_TTA"
 
     result_block = (
         f"\n---\n"
