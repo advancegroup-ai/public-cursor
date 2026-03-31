@@ -1,13 +1,14 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: ResNet50 6ch with multi-scale feature pyramid + gradient 
-accumulation + cosine warmup + TTA at inference.
-Key ideas:
-- ResNet50 for deeper features vs ResNet18
-- Extract features from multiple layers (layer2, layer3, layer4) and combine
-- Gradient accumulation (4 steps) for effective batch size 128
+BEST CANDIDATE: Hybrid ResNet18 + handcrafted noise/gradient/DCT features fusion
+with focal loss + warmup cosine + stratified split.
+
+This combines the strongest elements from our experiments:
+- ResNet18 backbone for spatial features (proven baseline at 0.976659)
+- Handcrafted features (noise, gradient, FFT, DCT) that achieved 100% on smaller dataset
+- Focal loss for hard example mining
 - Warmup + cosine LR schedule
-- Test-time augmentation (original + horizontal flip) for more robust predictions
+- Stratified split for fair evaluation
 Previous best on DGX1: 0.976659 (ResNet18 6ch baseline).
 """
 import os
@@ -42,6 +43,55 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
+def extract_handcrafted(img_pil):
+    """Extract handcrafted features: noise, gradient, FFT, DCT, color."""
+    img_np = np.array(img_pil).astype(np.float32)
+    gray = np.array(img_pil.convert("L")).astype(np.float32)
+    features = []
+
+    from scipy.ndimage import laplace
+    lap = laplace(gray)
+    features.append(np.var(lap))
+    features.append(np.abs(lap).mean())
+
+    gy = np.diff(gray, axis=0)
+    gx = np.diff(gray, axis=1)
+    features.append(np.abs(gy).mean())
+    features.append(np.abs(gx).mean())
+    features.append(np.std(gy))
+    features.append(np.std(gx))
+
+    fft = np.fft.fft2(gray)
+    fft_shift = np.fft.fftshift(fft)
+    mag = np.abs(fft_shift)
+    h, w = mag.shape
+    cy, cx = h // 2, w // 2
+    r = min(h, w) // 8
+    Y, X = np.ogrid[:h, :w]
+    center_mask = (Y - cy)**2 + (X - cx)**2 <= r**2
+    low_energy = mag[center_mask].sum()
+    total_energy = mag.sum() + 1e-10
+    features.append(1.0 - low_energy / total_energy)
+
+    from scipy.fft import dct
+    gray_small = np.array(img_pil.convert("L").resize((64, 64))).astype(np.float32)
+    dct_coeffs = dct(dct(gray_small, axis=0, norm='ortho'), axis=1, norm='ortho')
+    dct_mag = np.abs(dct_coeffs)
+    dct_total = dct_mag.sum() + 1e-10
+    features.append(dct_mag[:8, :8].sum() / dct_total)
+    features.append(dct_mag[8:32, 8:32].sum() / dct_total)
+    features.append(dct_mag[32:, 32:].sum() / dct_total)
+
+    channel_means = img_np.mean(axis=(0, 1))
+    blue_shift = channel_means[2] - (channel_means[0] + channel_means[1]) / 2.0
+    features.append(blue_shift)
+
+    features.append(np.std(gray))
+    features.append(float(np.percentile(gray, 95) - np.percentile(gray, 5)))
+
+    return np.array(features, dtype=np.float32)
+
+
 class LivenessDataset(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
@@ -67,64 +117,71 @@ class LivenessDataset(Dataset):
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
 
+        far_feats = extract_handcrafted(far_img)
+        near_feats = extract_handcrafted(near_img)
+        diff_feats = far_feats - near_feats
+        handcrafted = np.concatenate([far_feats, near_feats, diff_feats])
+        handcrafted = np.nan_to_num(handcrafted, nan=0.0, posinf=1e6, neginf=-1e6)
+        handcrafted_tensor = torch.from_numpy(handcrafted)
+
         if self.transform:
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
         img = torch.cat([far_img, near_img], dim=0)
-        return img, label
+        return img, handcrafted_tensor, label
 
 
-class MultiScaleResNet50(nn.Module):
-    """ResNet50 with multi-scale feature pyramid network for 6-channel input."""
-    def __init__(self, num_classes=2):
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
         super().__init__()
-        base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        self.alpha = alpha
+        self.gamma = gamma
 
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+
+class HybridModel(nn.Module):
+    def __init__(self, handcrafted_dim=42, num_classes=2):
+        super().__init__()
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         old_conv = base.conv1
         base.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
         with torch.no_grad():
             base.conv1.weight[:, :3] = old_conv.weight
             base.conv1.weight[:, 3:] = old_conv.weight
 
-        self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
-        self.layer1 = base.layer1  # 256
-        self.layer2 = base.layer2  # 512
-        self.layer3 = base.layer3  # 1024
-        self.layer4 = base.layer4  # 2048
+        feat_dim = base.fc.in_features
+        base.fc = nn.Identity()
+        self.backbone = base
 
-        self.pool = nn.AdaptiveAvgPool2d(1)
-
-        self.proj2 = nn.Linear(512, 256)
-        self.proj3 = nn.Linear(1024, 256)
-        self.proj4 = nn.Linear(2048, 256)
-
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(256 * 3),
-            nn.Dropout(0.4),
-            nn.Linear(256 * 3, 256),
+        self.handcrafted_proj = nn.Sequential(
+            nn.BatchNorm1d(handcrafted_dim),
+            nn.Linear(handcrafted_dim, 128),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(256, num_classes),
+            nn.Linear(128, 64),
+            nn.GELU(),
         )
 
-    def forward(self, x):
-        x = self.stem(x)
-        x1 = self.layer1(x)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feat_dim + 64),
+            nn.Dropout(0.3),
+            nn.Linear(feat_dim + 64, 256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
+        )
 
-        f2 = self.pool(x2).flatten(1)
-        f3 = self.pool(x3).flatten(1)
-        f4 = self.pool(x4).flatten(1)
-
-        p2 = F.gelu(self.proj2(f2))
-        p3 = F.gelu(self.proj3(f3))
-        p4 = F.gelu(self.proj4(f4))
-
-        multi = torch.cat([p2, p3, p4], dim=1)
-        return self.classifier(multi)
+    def forward(self, img, handcrafted):
+        deep_feat = self.backbone(img)
+        hand_feat = self.handcrafted_proj(handcrafted)
+        fused = torch.cat([deep_feat, hand_feat], dim=1)
+        return self.classifier(fused)
 
 
 def load_data():
@@ -173,48 +230,45 @@ def train():
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
-    transform_tta_flip = T.Compose([
-        T.Resize((224, 224)),
-        T.RandomHorizontalFlip(p=1.0),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+
+    n_hand = 14  # features per image
+    hand_dim = n_hand * 3  # far + near + diff
 
     train_ds = LivenessDataset(train_ids, labels, transform_train)
     test_ds = LivenessDataset(test_ids, labels, transform_test)
-    test_ds_flip = LivenessDataset(test_ids, labels, transform_tta_flip)
 
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader_flip = DataLoader(test_ds_flip, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = MultiScaleResNet50().to(device)
+    model = HybridModel(handcrafted_dim=hand_dim).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Multi-Scale ResNet50 (6ch), params: {num_params:,}")
+    print(f"Model: Hybrid ResNet18 + handcrafted (noise/grad/FFT/DCT), params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
+    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-4)
-    epochs = 15
-    accum_steps = 4
+    optimizer = torch.optim.AdamW([
+        {'params': model.backbone.parameters(), 'lr': 5e-5},
+        {'params': list(model.handcrafted_proj.parameters()) + list(model.classifier.parameters()), 'lr': 3e-4},
+    ], weight_decay=1e-4)
+
+    epochs = 20
 
     def lr_lambda(epoch):
-        warmup = 2
+        warmup = 3
         if epoch < warmup:
             return (epoch + 1) / warmup
         progress = (epoch - warmup) / max(1, epochs - warmup)
-        return max(1e-6 / 1e-4, 0.5 * (1 + math.cos(math.pi * progress)))
+        return max(1e-6 / 3e-4, 0.5 * (1 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
-    best_state = None
 
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
@@ -223,61 +277,46 @@ def train():
 
         model.train()
         total_loss = 0
-        optimizer.zero_grad()
-        for step, (imgs, targets) in enumerate(train_loader):
-            imgs, targets = imgs.to(device), targets.to(device)
-            out = model(imgs)
-            loss = criterion(out, targets) / accum_steps
+        for imgs, handcrafted, targets in train_loader:
+            imgs = imgs.to(device)
+            handcrafted = handcrafted.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad()
+            out = model(imgs, handcrafted)
+            loss = criterion(out, targets)
             loss.backward()
-
-            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-
-            total_loss += loss.item() * accum_steps
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
 
         scheduler.step()
 
         model.eval()
-        all_probs = []
-        all_probs_flip = []
-        all_labels_list = []
-
+        all_preds, all_labels = [], []
         with torch.no_grad():
-            for imgs, targets in test_loader:
+            for imgs, handcrafted, targets in test_loader:
                 imgs = imgs.to(device)
-                out = F.softmax(model(imgs), dim=1)
-                all_probs.append(out.cpu())
-                all_labels_list.extend(targets.numpy())
+                handcrafted = handcrafted.to(device)
+                out = model(imgs, handcrafted)
+                preds = out.argmax(dim=1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(targets.numpy())
 
-            for imgs, targets in test_loader_flip:
-                imgs = imgs.to(device)
-                out = F.softmax(model(imgs), dim=1)
-                all_probs_flip.append(out.cpu())
-
-        all_probs = torch.cat(all_probs, dim=0)
-        all_probs_flip = torch.cat(all_probs_flip, dim=0)
-        tta_probs = (all_probs + all_probs_flip) / 2.0
-        tta_preds = tta_probs.argmax(dim=1).numpy()
-        no_tta_preds = all_probs.argmax(dim=1).numpy()
-
-        bal_acc = balanced_accuracy_score(all_labels_list, tta_preds)
-        bal_acc_no_tta = balanced_accuracy_score(all_labels_list, no_tta_preds)
-        acc = accuracy_score(all_labels_list, tta_preds)
-        f1 = f1_score(all_labels_list, tta_preds, average="binary")
+        bal_acc = balanced_accuracy_score(all_labels, all_preds)
+        acc = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
+        lr = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f}(TTA)/{bal_acc_no_tta:.4f}(no-TTA) f1={f1:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} lr={lr:.6f}")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
             best_acc = acc
             best_f1 = f1
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     elapsed = time.time() - t0
-    approach = "resnet50_multiscale_fpn_6ch_grad_accum4x_warmup_cosine_tta"
+    approach = "hybrid_resnet18_handcrafted_noise_grad_fft_dct_focal_warmup_cosine"
 
     result_block = (
         f"\n---\n"
