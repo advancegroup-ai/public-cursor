@@ -1,14 +1,9 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: ResNet18 6ch + Focal Loss + MixUp + Warmup Cosine LR +
-RandAugment + Stratified split + Gradient clipping.
-Key changes from baseline (0.976659):
-- Focal loss (gamma=2) for hard example mining
-- MixUp augmentation (alpha=0.3) for regularization
-- Linear warmup + cosine annealing LR schedule
-- RandAugment for strong data augmentation
-- Gradient clipping at 1.0
-- Stratified train/test split
+Experiment: Dual-stream ResNet18 with Gated Attention Fusion.
+Each stream (far/near) has its own ResNet18 encoder. Features are
+fused via a learned gating mechanism that attends to the most
+discriminative stream per sample. Includes label smoothing + cosine LR.
 Previous best on DGX1: 0.976659 (ResNet18 6ch baseline).
 """
 import os
@@ -43,19 +38,6 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        return focal_loss.mean()
-
-
 class LivenessDataset(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
@@ -85,49 +67,45 @@ class LivenessDataset(Dataset):
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
-        img = torch.cat([far_img, near_img], dim=0)
-        return img, label
+        return far_img, near_img, label
 
 
-def mixup_data(x, y, alpha=0.3):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1.0
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size, device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[index]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+class GatedDualStream(nn.Module):
+    """Dual-stream ResNet18 with gated attention fusion."""
+    def __init__(self, num_classes=2):
+        super().__init__()
+        self.far_encoder = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.near_encoder = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
 
+        feat_dim = self.far_encoder.fc.in_features  # 512
+        self.far_encoder.fc = nn.Identity()
+        self.near_encoder.fc = nn.Identity()
 
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+        self.gate = nn.Sequential(
+            nn.Linear(feat_dim * 2, feat_dim),
+            nn.ReLU(),
+            nn.Linear(feat_dim, 2),
+            nn.Softmax(dim=1),
+        )
 
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Dropout(0.3),
+            nn.Linear(feat_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes),
+        )
 
-def build_model(num_classes=2):
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-    old_conv = model.conv1
-    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    with torch.no_grad():
-        model.conv1.weight[:, :3] = old_conv.weight
-        model.conv1.weight[:, 3:] = old_conv.weight
+    def forward(self, far, near):
+        far_feat = self.far_encoder(far)   # [B, 512]
+        near_feat = self.near_encoder(near) # [B, 512]
 
-    in_features = model.fc.in_features
-    model.fc = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(in_features, num_classes)
-    )
-    return model
+        concat = torch.cat([far_feat, near_feat], dim=1)  # [B, 1024]
+        gate_weights = self.gate(concat)  # [B, 2]
 
-
-def get_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return max(min_lr / optimizer.defaults['lr'], 0.5 * (1 + math.cos(math.pi * progress)))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        fused = gate_weights[:, 0:1] * far_feat + gate_weights[:, 1:2] * near_feat
+        return self.classifier(fused)
 
 
 def load_data():
@@ -167,11 +145,9 @@ def train():
         T.Resize((256, 256)),
         T.RandomCrop(224),
         T.RandomHorizontalFlip(),
-        T.RandAugment(num_ops=2, magnitude=9),
-        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        T.RandomErasing(p=0.2),
     ])
     transform_test = T.Compose([
         T.Resize((224, 224)),
@@ -182,27 +158,30 @@ def train():
     train_ds = LivenessDataset(train_ids, labels, transform_train)
     test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = build_model().to(device)
+    model = GatedDualStream().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 (6ch) + Focal Loss + MixUp, params: {num_params:,}")
+    print(f"Model: Gated Dual-Stream ResNet18, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
-    epochs = 20
-    scheduler = get_warmup_cosine_scheduler(optimizer, warmup_epochs=2, total_epochs=epochs)
+    optimizer = torch.optim.AdamW([
+        {'params': list(model.far_encoder.parameters()) + list(model.near_encoder.parameters()), 'lr': 5e-5},
+        {'params': list(model.gate.parameters()) + list(model.classifier.parameters()), 'lr': 3e-4},
+    ], weight_decay=1e-4)
+
+    epochs = 15
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     best_bal_acc = 0
     best_acc = 0
     best_f1 = 0
-    best_state = None
 
     for epoch in range(epochs):
         if time.time() - t0 > MAX_SECONDS:
@@ -211,19 +190,11 @@ def train():
 
         model.train()
         total_loss = 0
-        for imgs, targets in train_loader:
-            imgs, targets = imgs.to(device), targets.to(device)
-
-            if epoch >= 2:
-                imgs, y_a, y_b, lam = mixup_data(imgs, targets, alpha=0.3)
-                optimizer.zero_grad()
-                out = model(imgs)
-                loss = mixup_criterion(criterion, out, y_a, y_b, lam)
-            else:
-                optimizer.zero_grad()
-                out = model(imgs)
-                loss = criterion(out, targets)
-
+        for far, near, targets in train_loader:
+            far, near, targets = far.to(device), near.to(device), targets.to(device)
+            optimizer.zero_grad()
+            out = model(far, near)
+            loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -234,9 +205,9 @@ def train():
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for imgs, targets in test_loader:
-                imgs = imgs.to(device)
-                out = model(imgs)
+            for far, near, targets in test_loader:
+                far, near = far.to(device), near.to(device)
+                out = model(far, near)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -253,10 +224,9 @@ def train():
             best_bal_acc = bal_acc
             best_acc = acc
             best_f1 = f1
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     elapsed = time.time() - t0
-    approach = "resnet18_6ch_focal_loss_mixup_warmup_cosine_randaug_20ep"
+    approach = "dual_stream_resnet18_gated_attention_fusion_label_smoothing"
 
     result_block = (
         f"\n---\n"
