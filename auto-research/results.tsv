@@ -30,3 +30,7 @@ c8ca6ed	0.966667	discard	AdaBoost 3 stumps + 2 noise - close but not perfect
 --- iter2 DGX1 deep learning experiments (real 2586-sample dataset) ---
 6dc40d3	0.976659	keep	[DGX1] ResNet18 pretrained 6ch (far+near) baseline, Adam lr=1e-4, 15 epochs
 ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders) + OneCycleLR - worse than single stream
+--- iter21 DGX1 experiments (316k-label dataset, balanced sampling, focal loss) ---
+1423b8b	0.885731	keep	[DGX1] EfficientNet-B0 6ch focal-loss balanced-5k/class cosine-warmup heavy-aug (NAS-direct, 537s)
+a472830	0.801525	discard	[DGX1] EfficientNet-B0 6ch focal-loss balanced-1500/class local-SSD-cache (only 1 epoch due to slow copy)
+b3aa3fa	N/A	timeout	[DGX1] EfficientNet-B0 6ch focal-loss balanced-2k/class NAS-direct 8-workers (API timeout before result)

@@ -1,6 +1,7 @@
 """
-train.py — Liveness: EfficientNet-B0 + focal loss, fast data loading via pre-filtered IDs.
-Uses disk_ids set to avoid slow file existence checks.
+train.py — Liveness: EfficientNet-B0 + focal loss + balanced sampling.
+Optimized for DGX1 with NAS. Pre-filters using os.listdir for speed.
+Key: uses all negatives (13k) + balanced positives, more epochs.
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -19,7 +20,7 @@ from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 NAS_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = NAS_DIR / "last_result.json"
 SEED = 42
-MAX_SECONDS = 210
+MAX_SECONDS = 250
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -73,7 +74,7 @@ class LivenessDataset(Dataset):
 
 
 def load_data():
-    """Fast: list disk dirs once, cross-ref with annotations_full.jsonl."""
+    """Fast load: os.listdir + jsonl cross-ref. Cap at MAX_PER_CLASS for balance."""
     t0 = time.time()
 
     samples_dir = NAS_DIR / "samples"
@@ -97,12 +98,12 @@ def load_data():
                     negatives.append(sig)
                     label_map[sig] = 1
 
-    print(f"On-disk labeled: {len(positives)} pos, {len(negatives)} neg ({time.time()-t0:.1f}s)")
+    print(f"On-disk: {len(positives)} pos, {len(negatives)} neg ({time.time()-t0:.1f}s)")
 
     random.shuffle(positives)
     random.shuffle(negatives)
 
-    MAX_PER_CLASS = 2000
+    MAX_PER_CLASS = min(3000, len(negatives))
     positives = positives[:MAX_PER_CLASS]
     negatives = negatives[:MAX_PER_CLASS]
 
@@ -122,7 +123,7 @@ def load_data():
 
 
 def build_model(num_classes=2):
-    """EfficientNet-B0 pretrained, modified for 6-channel input."""
+    """EfficientNet-B0 pretrained, 6-channel input (far+near concat)."""
     model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
 
     old_conv = model.features[0][0]
@@ -202,7 +203,7 @@ def train():
     for epoch in range(epochs):
         elapsed = time.time() - t0
         if elapsed > MAX_SECONDS:
-            print(f"Time budget reached at epoch {epoch} ({elapsed:.1f}s)")
+            print(f"Time budget at epoch {epoch} ({elapsed:.1f}s)")
             break
 
         model.train()
@@ -243,7 +244,7 @@ def train():
 
     elapsed = time.time() - t0
 
-    approach = "efficientnet_b0_6ch_focal_balanced2k_nas_direct_cosine_warmup"
+    approach = "efficientnet_b0_6ch_focal_balanced3k_cosine_warmup_aug"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
