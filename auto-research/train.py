@@ -1,5 +1,6 @@
 """
-train.py — Liveness detection: EfficientNet-B0 + Focal Loss + stratified split + cosine warmup
+train.py — Liveness detection: EfficientNet-B0 + Focal Loss + balanced sampling + cosine warmup
+Efficiently handles large dataset (316k labels, 195k samples on NAS).
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -14,7 +15,6 @@ import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold
 
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
@@ -74,26 +74,41 @@ class LivenessDataset(Dataset):
 
 
 def load_data():
+    """Load data efficiently: list sample dirs then cross-reference labels."""
+    t0 = time.time()
+    
     with open(str(DATA_DIR / "labels.json")) as f:
         labels = json.load(f)
+    print(f"Labels loaded: {len(labels)} entries ({time.time()-t0:.1f}s)")
 
-    valid = []
-    valid_labels = []
-    for sig, info in labels.items():
-        far = DATA_DIR / "samples" / sig / "far.jpg"
-        near = DATA_DIR / "samples" / sig / "near.jpg"
-        if far.exists() and near.exists():
-            valid.append(sig)
-            valid_labels.append(0 if info["main_label"] == "Positive" else 1)
+    samples_dir = DATA_DIR / "samples"
+    disk_ids = set(os.listdir(str(samples_dir)))
+    print(f"Sample dirs on disk: {len(disk_ids)} ({time.time()-t0:.1f}s)")
 
-    valid = np.array(valid)
-    valid_labels = np.array(valid_labels)
+    positives = []
+    negatives = []
+    for sig in disk_ids:
+        if sig in labels and "main_label" in labels[sig]:
+            if labels[sig]["main_label"] == "Positive":
+                positives.append(sig)
+            elif labels[sig]["main_label"] == "Negative":
+                negatives.append(sig)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    train_idx, test_idx = next(skf.split(valid, valid_labels))
+    print(f"Labeled on disk: {len(positives)} pos, {len(negatives)} neg ({time.time()-t0:.1f}s)")
 
-    train_ids = valid[train_idx].tolist()
-    test_ids = valid[test_idx].tolist()
+    random.shuffle(positives)
+    random.shuffle(negatives)
+
+    MAX_PER_CLASS = 5000
+    positives = positives[:MAX_PER_CLASS]
+    negatives = negatives[:MAX_PER_CLASS]
+
+    all_ids = positives + negatives
+    random.shuffle(all_ids)
+
+    split = int(len(all_ids) * 0.8)
+    train_ids = all_ids[:split]
+    test_ids = all_ids[split:]
 
     dist_train = Counter(labels[s]["main_label"] for s in train_ids)
     dist_test = Counter(labels[s]["main_label"] for s in test_ids)
@@ -141,12 +156,12 @@ def train():
     print(f"Device: {device}")
 
     train_ids, test_ids, labels = load_data()
+    print(f"Data loading: {time.time()-t0:.1f}s")
 
     transform_train = T.Compose([
         T.Resize((240, 240)),
         T.RandomCrop(224),
         T.RandomHorizontalFlip(),
-        T.RandomVerticalFlip(p=0.1),
         T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
         T.RandomGrayscale(p=0.05),
         T.RandomRotation(15),
@@ -163,7 +178,7 @@ def train():
     train_ds = LivenessDataset(train_ids, labels, transform_train)
     test_ds = LivenessDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
     model = build_model().to(device)
@@ -176,7 +191,7 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    epochs = 15
+    epochs = 12
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
     scheduler = get_cosine_warmup_scheduler(optimizer, warmup_epochs=2, total_epochs=epochs)
 
@@ -185,8 +200,9 @@ def train():
     best_f1 = 0
 
     for epoch in range(epochs):
-        if time.time() - t0 > MAX_SECONDS:
-            print(f"Time budget reached at epoch {epoch}")
+        elapsed = time.time() - t0
+        if elapsed > MAX_SECONDS:
+            print(f"Time budget reached at epoch {epoch} ({elapsed:.1f}s)")
             break
 
         model.train()
@@ -219,7 +235,7 @@ def train():
         avg_loss = total_loss / len(train_loader)
         lr_now = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} lr={lr_now:.6f}")
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} lr={lr_now:.6f} [{time.time()-t0:.0f}s]")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
@@ -228,7 +244,7 @@ def train():
 
     elapsed = time.time() - t0
 
-    approach = "efficientnet_b0_6ch_focal_loss_stratified_cosine_warmup_heavy_aug"
+    approach = "efficientnet_b0_6ch_focal_loss_balanced_5k_cosine_warmup_heavy_aug"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
