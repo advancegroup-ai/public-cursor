@@ -35,3 +35,4 @@ ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders
 --- iter22 experiments ---
 ab45ba4	N/A	blocked	[DGX1] ResNet18 6ch + focal loss + MixUp + OneCycleLR + strong aug - VT_TOKEN missing
 708da0f	N/A	blocked	[DGX1] Hybrid ResNet18 + handcrafted noise/grad/FFT/color features fusion - VT_TOKEN missing
+bf112eb	N/A	blocked	[DGX1] ResNet50 6ch + Adam 5e-5 + cosine 20ep + label smoothing + grad accum - VT_TOKEN missing
