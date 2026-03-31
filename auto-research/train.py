@@ -1,8 +1,11 @@
 """
-train.py — Liveness detection: Triple-stream (far + near + difference) ResNet18 shared encoder + TTA
-Key innovation: A 3rd stream processes the absolute difference between far and near images.
-The difference highlights inconsistencies between the two shots that may indicate
-spoofing (e.g., identical texture from screens, artifacts from deepfakes).
+train.py — Liveness detection: Dual-stream EfficientNet-V2-S shared encoder + GeM pooling + TTA
+Key innovations:
+1. EfficientNet-V2-S: modern efficient backbone, better than ResNet18 on ImageNet
+2. GeM pooling: generalized mean pooling is better than avgpool for fine-grained tasks
+3. Shared encoder between far/near: preserves pretrained weights
+4. Differential LR: slow backbone, fast head
+5. AMP for speed (fits more epochs in time budget)
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -15,6 +18,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold
@@ -31,12 +35,11 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
-class LivenessDatasetTriple(Dataset):
-    def __init__(self, sig_ids, labels, transform=None, diff_transform=None):
+class LivenessDatasetDual(Dataset):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
         self.transform = transform
-        self.diff_transform = diff_transform or transform
         self.samples_dir = DATA_DIR / "samples"
 
     def __len__(self):
@@ -54,27 +57,10 @@ class LivenessDatasetTriple(Dataset):
         except Exception:
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
-
-        far_resized = far_img.resize((224, 224))
-        near_resized = near_img.resize((224, 224))
-        far_np = np.array(far_resized, dtype=np.float32)
-        near_np = np.array(near_resized, dtype=np.float32)
-        diff_np = np.abs(far_np - near_np).clip(0, 255).astype(np.uint8)
-        diff_img = Image.fromarray(diff_np, mode="RGB")
-
         if self.transform:
-            far_t = self.transform(far_img)
-            near_t = self.transform(near_img)
-        else:
-            far_t = T.ToTensor()(far_img)
-            near_t = T.ToTensor()(near_img)
-
-        if self.diff_transform:
-            diff_t = self.diff_transform(diff_img)
-        else:
-            diff_t = T.ToTensor()(diff_img)
-
-        return far_t, near_t, diff_t, label
+            far_img = self.transform(far_img)
+            near_img = self.transform(near_img)
+        return far_img, near_img, label
 
 
 def load_data():
@@ -108,36 +94,40 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class TripleStreamResNet(nn.Module):
-    """Shared ResNet18 encoder for far, near, and difference images."""
+class GeM(nn.Module):
+    """Generalized Mean Pooling."""
+    def __init__(self, p=3.0, eps=1e-6):
+        super().__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        return x.clamp(min=self.eps).pow(self.p).mean(dim=[-2, -1]).pow(1.0 / self.p)
+
+
+class DualStreamEfficientNetV2(nn.Module):
+    """Shared EfficientNet-V2-S encoder + GeM pooling for far/near images."""
     def __init__(self, num_classes=2):
         super().__init__()
-        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.encoder = nn.Sequential(*list(base.children())[:-1])
-        feat_dim = 512
+        base = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.IMAGENET1K_V1)
+        self.features = base.features
+        self.gem = GeM(p=3.0)
 
-        self.gate = nn.Sequential(
-            nn.Linear(feat_dim * 3, feat_dim * 3),
-            nn.Sigmoid(),
-        )
-
+        feat_dim = 1280
         self.classifier = nn.Sequential(
-            nn.BatchNorm1d(feat_dim * 3),
-            nn.Dropout(0.3),
-            nn.Linear(feat_dim * 3, 256),
+            nn.BatchNorm1d(feat_dim * 2),
+            nn.Dropout(0.4),
+            nn.Linear(feat_dim * 2, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(256, num_classes),
         )
 
-    def forward(self, far, near, diff):
-        f_far = self.encoder(far).flatten(1)
-        f_near = self.encoder(near).flatten(1)
-        f_diff = self.encoder(diff).flatten(1)
-        combined = torch.cat([f_far, f_near, f_diff], dim=1)
-        gate_weights = self.gate(combined)
-        gated = combined * gate_weights
-        return self.classifier(gated)
+    def forward(self, far, near):
+        f_far = self.gem(self.features(far))
+        f_near = self.gem(self.features(near))
+        combined = torch.cat([f_far, f_near], dim=1)
+        return self.classifier(combined)
 
 
 class FocalLoss(nn.Module):
@@ -161,9 +151,10 @@ def train():
 
     transform_train = T.Compose([
         T.Resize((256, 256)),
-        T.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        T.RandomResizedCrop(224, scale=(0.75, 1.0)),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.1, hue=0.03),
+        T.RandomGrayscale(p=0.05),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -173,15 +164,15 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = LivenessDatasetTriple(train_ids, labels, transform_train, transform_train)
-    test_ds = LivenessDatasetTriple(test_ids, labels, transform_test, transform_test)
+    train_ds = LivenessDatasetDual(train_ids, labels, transform_train)
+    test_ds = LivenessDatasetDual(test_ids, labels, transform_test)
 
     train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = TripleStreamResNet().to(device)
+    model = DualStreamEfficientNetV2().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Triple-stream ResNet18 shared (far+near+diff) + gated fusion, params: {num_params:,}")
+    print(f"Model: Dual EfficientNet-V2-S shared + GeM, params: {num_params:,}")
 
     train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels_list)
@@ -189,9 +180,15 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = FocalLoss(alpha=weight.to(device), gamma=1.5)
 
-    epochs = 12
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    backbone_params = list(model.features.parameters())
+    head_params = list(model.gem.parameters()) + list(model.classifier.parameters())
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': 3e-5},
+        {'params': head_params, 'lr': 2e-4},
+    ], weight_decay=1e-3)
 
+    scaler = GradScaler()
+    epochs = 10
     total_steps = epochs * len(train_loader)
     warmup_steps = len(train_loader)
 
@@ -214,29 +211,28 @@ def train():
 
         model.train()
         total_loss = 0
-        for far, near, diff, targets in train_loader:
-            far, near, diff = far.to(device), near.to(device), diff.to(device)
-            targets = targets.to(device)
+        for far, near, targets in train_loader:
+            far, near, targets = far.to(device), near.to(device), targets.to(device)
             optimizer.zero_grad()
-            out = model(far, near, diff)
-            loss = criterion(out, targets)
-            loss.backward()
+            with autocast():
+                out = model(far, near)
+                loss = criterion(out, targets)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             total_loss += loss.item()
 
         model.eval()
         all_preds, all_labels_list = [], []
         with torch.no_grad():
-            for far, near, diff, targets in test_loader:
-                far, near, diff = far.to(device), near.to(device), diff.to(device)
-                out1 = model(far, near, diff)
-                out2 = model(
-                    torch.flip(far, dims=[3]),
-                    torch.flip(near, dims=[3]),
-                    torch.flip(diff, dims=[3]),
-                )
+            for far, near, targets in test_loader:
+                far, near = far.to(device), near.to(device)
+                with autocast():
+                    out1 = model(far, near)
+                    out2 = model(torch.flip(far, dims=[3]), torch.flip(near, dims=[3]))
                 out = (out1 + out2) / 2.0
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
@@ -254,7 +250,7 @@ def train():
             best_f1 = f1v
 
     elapsed = time.time() - t0
-    approach = "triple_stream_resnet18_shared_far_near_diff_gated_fusion_focal_TTA"
+    approach = "dual_efficientnet_v2s_shared_GeM_focal_diff_LR_AMP_TTA"
 
     result_block = (
         f"\n---\n"
