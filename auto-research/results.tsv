@@ -45,3 +45,4 @@ c1de7ba	N/A	blocked	[DGX1] Multi-scale ResNet18 shared encoder (112+224+336) wit
 --- iter12 experiments ---
 9de2fd6	0.970208	discard	[DGX1] EfficientNet-B0 6ch + focal loss + OneCycleLR + strong aug (9 epochs, 252.5s)
 a085e47	N/A	blocked	[DGX1] Hybrid ResNet18 + handcrafted noise/freq features fused MLP - token expired
+1aa02e7	N/A	blocked	[DGX1] ResNet18 6ch tuned - OneCycleLR + TTA + strong aug + grad accum - token expired
