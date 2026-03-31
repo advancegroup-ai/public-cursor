@@ -30,3 +30,5 @@ c8ca6ed	0.966667	discard	AdaBoost 3 stumps + 2 noise - close but not perfect
 --- iter2 DGX1 deep learning experiments (real 2586-sample dataset) ---
 6dc40d3	0.976659	keep	[DGX1] ResNet18 pretrained 6ch (far+near) baseline, Adam lr=1e-4, 15 epochs
 ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders) + OneCycleLR - worse than single stream
+aeba854	0.967835	discard	[DGX1] ResNet18 6ch + MixUp + focal loss + cosine warmup + AdamW - worse than baseline
+3334b4b	0.979916	keep	[DGX1] ResNet50 6ch + Adam lr=1e-4 + cosine + 15 epochs - NEW BEST
