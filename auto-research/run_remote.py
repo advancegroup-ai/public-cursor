@@ -17,14 +17,45 @@ import re
 import os
 
 API_URL = "https://vibe-track.ngrok.app"
-# Token injected by orchestrator or read from env
 API_TOKEN = os.environ.get("VT_TOKEN", "")
+REFRESH_TOKEN = os.environ.get("VT_REFRESH_TOKEN", "")
+_cached_token = ""
+
+
+def refresh_access_token() -> str:
+    """Use refresh token to get a fresh access token."""
+    global _cached_token
+    if not REFRESH_TOKEN:
+        return ""
+    import urllib.request
+    try:
+        body = json.dumps({"refresh_token": REFRESH_TOKEN}).encode()
+        req = urllib.request.Request(
+            f"{API_URL}/api/auth/refresh",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        _cached_token = data.get("access_token", "")
+        return _cached_token
+    except Exception:
+        return ""
 
 
 def get_token():
+    global _cached_token
+    if _cached_token:
+        return _cached_token
     if API_TOKEN:
         return API_TOKEN
-    # Try reading from NAS (won't work in sandbox, but useful for local testing)
+    # Try refresh token first (works in Cloud Agent sandbox)
+    if REFRESH_TOKEN:
+        t = refresh_access_token()
+        if t:
+            return t
+    # Fallback: read from NAS (local testing only)
     try:
         import subprocess
         result = subprocess.run(
@@ -61,6 +92,17 @@ def run_on_dgx1(script_code: str, timeout: int = 300) -> dict:
         with urllib.request.urlopen(req, timeout=timeout + 60) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
+        if e.code == 401 and REFRESH_TOKEN:
+            # Token expired — refresh and retry once
+            new_token = refresh_access_token()
+            if new_token:
+                req.remove_header("Authorization")
+                req.add_header("Authorization", f"Bearer {new_token}")
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout + 60) as resp:
+                        return json.loads(resp.read().decode())
+                except Exception as e2:
+                    return {"status": "error", "error": str(e2)}
         return {"status": "error", "error": f"HTTP {e.code}: {e.read().decode()[:500]}"}
     except Exception as e:
         return {"status": "error", "error": str(e)}
