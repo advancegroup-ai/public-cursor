@@ -44,3 +44,9 @@ c89a873	N/A	blocked	[DGX1] EfficientNet-B2 6ch + cosine warmup + label smoothing
 ac6a50c	N/A	blocked	[DGX1] Hybrid ResNet18 + handcrafted noise/grad/FFT features fusion (21 feats) - VT_TOKEN missing
 317b076	N/A	blocked	[DGX1] EfficientNet-B0 6ch + label smoothing + OneCycleLR + strong aug + TTA - VT_TOKEN missing
 2ca18c7	N/A	blocked	[DGX1] ResNet50 6ch + grad accum 4x + OneCycleLR + label smoothing + strong aug - VT_TOKEN missing
+--- iter24 experiments ---
+76a782d	N/A	blocked	[DGX1] Handcrafted 88 features (noise/grad/FFT/color/texture) + GBM/RF ensemble - VT_TOKEN missing
+82bfd2c	N/A	blocked	[DGX1] ResNet18 6ch + focal loss + MixUp + warmup cosine LR + RandAugment - VT_TOKEN missing
+ac13229	N/A	blocked	[DGX1] Dual-stream ResNet18 + gated attention fusion + label smoothing + diff LR - VT_TOKEN missing
+dbfe6c5	N/A	blocked	[DGX1] EfficientNet-B0 6ch + DCT freq features fusion - VT_TOKEN missing
+258429f	N/A	blocked	[DGX1] ResNet50 multi-scale FPN 6ch + grad accum 4x + warmup cosine + TTA - VT_TOKEN missing
