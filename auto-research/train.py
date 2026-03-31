@@ -19,7 +19,7 @@ from sklearn.model_selection import StratifiedKFold
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
 SEED = 42
-MAX_SECONDS = 270
+MAX_SECONDS = 180
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -176,7 +176,7 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    epochs = 20
+    epochs = 15
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
     scheduler = get_cosine_warmup_scheduler(optimizer, warmup_epochs=2, total_epochs=epochs)
 
