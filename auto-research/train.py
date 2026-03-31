@@ -1,7 +1,9 @@
 """
-train.py — Liveness: ResNet50 6ch + MixUp + OneCycleLR + label smoothing
+train.py — Liveness: ResNet18 shared encoder + cross-attention between far & near + GeM pooling
 Best previous DGX1: 0.976659 (ResNet18 6ch baseline)
-ResNet50 has ~4x more parameters. With MixUp regularization, it shouldn't overfit.
+Idea: Process far and near with shared ResNet18 backbone, then use cross-attention
+to let each image attend to the other, capturing consistency/inconsistency cues.
+GeM pooling replaces avg pooling for better feature aggregation.
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -31,7 +33,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
 
-class LivenessDataset(Dataset):
+class DualImageDataset(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
@@ -60,24 +62,83 @@ class LivenessDataset(Dataset):
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
 
-        img = torch.cat([far_img, near_img], dim=0)
-        return img, label
+        return far_img, near_img, label
 
 
-def mixup_data(x, y, alpha=0.2):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size, device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[index]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+class GeM(nn.Module):
+    def __init__(self, p=3.0, eps=1e-6):
+        super().__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        return F.adaptive_avg_pool2d(x.clamp(min=self.eps).pow(self.p), 1).pow(1.0 / self.p)
 
 
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+class CrossAttention(nn.Module):
+    def __init__(self, dim, heads=4):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        self.q = nn.Linear(dim, dim)
+        self.kv = nn.Linear(dim, dim * 2)
+        self.proj = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x, context):
+        B, N, C = x.shape
+        h = self.heads
+
+        q = self.q(self.norm1(x)).reshape(B, N, h, C // h).permute(0, 2, 1, 3)
+        kv = self.kv(self.norm2(context)).reshape(B, -1, 2, h, C // h).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return x + self.proj(out)
+
+
+class CrossAttentionModel(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.features = nn.Sequential(*list(backbone.children())[:-2])
+        feat_dim = 512
+
+        self.gem = GeM()
+        self.cross_attn_far = CrossAttention(feat_dim, heads=4)
+        self.cross_attn_near = CrossAttention(feat_dim, heads=4)
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(feat_dim * 2, 256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, far, near):
+        far_feat_map = self.features(far)   # B, 512, 7, 7
+        near_feat_map = self.features(near)
+
+        B, C, H, W = far_feat_map.shape
+        far_tokens = far_feat_map.flatten(2).permute(0, 2, 1)    # B, 49, 512
+        near_tokens = near_feat_map.flatten(2).permute(0, 2, 1)
+
+        far_attended = self.cross_attn_far(far_tokens, near_tokens)
+        near_attended = self.cross_attn_near(near_tokens, far_tokens)
+
+        far_attended = far_attended.permute(0, 2, 1).reshape(B, C, H, W)
+        near_attended = near_attended.permute(0, 2, 1).reshape(B, C, H, W)
+
+        far_pool = self.gem(far_attended).flatten(1)
+        near_pool = self.gem(near_attended).flatten(1)
+
+        fused = torch.cat([far_pool, near_pool], dim=1)
+        return self.classifier(fused)
 
 
 def load_data():
@@ -104,21 +165,6 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-def build_model(num_classes=2):
-    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-    old_conv = model.conv1
-    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    with torch.no_grad():
-        model.conv1.weight[:, :3] = old_conv.weight
-        model.conv1.weight[:, 3:] = old_conv.weight
-
-    model.fc = nn.Sequential(
-        nn.Dropout(0.4),
-        nn.Linear(model.fc.in_features, num_classes),
-    )
-    return model
-
-
 def train():
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -141,28 +187,28 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = LivenessDataset(train_ids, labels, transform_train)
-    test_ds = LivenessDataset(test_ids, labels, transform_test)
+    train_ds = DualImageDataset(train_ids, labels, transform_train)
+    test_ds = DualImageDataset(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = build_model().to(device)
+    model = CrossAttentionModel(num_classes=2).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet50 (6-ch), params: {num_params:,}")
+    print(f"Model: ResNet18 shared + cross-attention + GeM, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.05)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
 
-    epochs = 12
+    epochs = 15
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=1e-4, epochs=epochs, steps_per_epoch=len(train_loader),
-        pct_start=0.2, anneal_strategy='cos',
+        optimizer, max_lr=2e-4, epochs=epochs, steps_per_epoch=len(train_loader),
+        pct_start=0.15, anneal_strategy='cos',
     )
 
     best_bal_acc = 0
@@ -176,14 +222,14 @@ def train():
 
         model.train()
         total_loss = 0
-        for imgs, targets in train_loader:
-            imgs, targets = imgs.to(device), targets.to(device)
-
-            mixed_imgs, targets_a, targets_b, lam = mixup_data(imgs, targets, alpha=0.3)
+        for far_imgs, near_imgs, targets in train_loader:
+            far_imgs = far_imgs.to(device)
+            near_imgs = near_imgs.to(device)
+            targets = targets.to(device)
 
             optimizer.zero_grad()
-            out = model(mixed_imgs)
-            loss = mixup_criterion(criterion, out, targets_a, targets_b, lam)
+            out = model(far_imgs, near_imgs)
+            loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -193,9 +239,10 @@ def train():
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for imgs, targets in test_loader:
-                imgs = imgs.to(device)
-                out = model(imgs)
+            for far_imgs, near_imgs, targets in test_loader:
+                far_imgs = far_imgs.to(device)
+                near_imgs = near_imgs.to(device)
+                out = model(far_imgs, near_imgs)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(targets.numpy())
@@ -213,7 +260,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "resnet50_6ch_mixup03_labelsmooth01_dropout04_onecycleLR"
+    approach = "resnet18_shared_encoder_cross_attention_GeM_pooling"
 
     result_block = (
         f"\n---\n"
