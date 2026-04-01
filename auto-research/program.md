@@ -4,11 +4,20 @@
 
 You are an autonomous ML researcher. Your goal: maximize **balanced_accuracy** on a liveness detection task.
 
-Each sample has **2 face images** (far shot + near shot) and a binary label:
-- `Positive` (label=0): live person  
-- `Negative` (label=1): attack (deepfake, screen replay, photocopy, etc.)
+Each sample has **3 images** and a binary label:
+- `far.jpg` — face far shot (full upper body)
+- `near.jpg` — face near shot (close-up)
+- `card.jpg` — ID document front (photo of the physical card)
 
-Dataset: 3,612 human-annotated samples on NAS. ~55% Positive, ~45% Negative.
+Labels:
+- `Positive` (label=0): live person  
+- `Negative` (label=1): attack (deepfake injection, screen replay, photocopy, etc.)
+
+**Important context:** Human annotators judge liveness by examining **all 3 images together**. They compare the face in far/near shots against the face on the ID card. This is especially critical for:
+- **Deepfake injection attacks** (70% of negatives): attacker submits a real ID card but a synthetic face — comparing card vs face reveals inconsistency
+- **Screen replay**: image quality artifacts differ between the card photo and the replayed face
+
+Dataset: ~3,600 human-annotated samples on NAS. ~93% Positive, ~7% Negative (imbalanced).
 
 ## Architecture
 
@@ -33,7 +42,7 @@ This sends `train.py` to DGX1 and prints stdout. The DGX1 has:
 └── samples/{signatureId}/
     ├── far.jpg              # Face far shot
     ├── near.jpg             # Face near shot  
-    └── card.jpg             # ID card (optional, not all samples have it)
+    └── card.jpg             # ID document front photo
 ```
 
 ## Rules
@@ -78,27 +87,29 @@ commit	balanced_acc	accuracy	f1	seconds	status	description
 
 ## Research Directions (suggested priority)
 
-### Phase 1 — Quick baselines
-- ResNet18 pretrained, 6-channel (far+near concat) ← **current baseline**
-- EfficientNet-B0 pretrained
-- Compare: far-only vs near-only vs far+near
+### Phase 1 — Use all 3 images (HIGH PRIORITY)
+Previous iterations only used far+near (2 images). **You MUST try using all 3 images** (far + near + card).
+- **3-stream architecture**: Separate ResNet18 encoders for far, near, card → fuse features → classifier
+- **9-channel concat**: Resize all 3 to 224x224, concat to 9ch tensor
+- **Dual-stream + card branch**: Keep the best dual-stream (far+near) and add a card verification branch
+- **Face-card consistency features**: Extract face embeddings from far/near and card, compare similarity
 
-### Phase 2 — Architecture improvements  
-- Separate encoders per image → fused classifier (dual-stream)
-- Add card image as third input
-- Try ViT / DeiT pretrained backbones
+Why this matters: The card image contains the **reference face** on the ID document. Attacks often have mismatches between the card face and the submitted far/near face. Human annotators rely on this comparison.
 
-### Phase 3 — Training tricks
-- Data augmentation: CutMix, MixUp, RandAugment
-- Learning rate scheduling experiments
-- Focal loss for hard examples
-- Larger models: ResNet50, EfficientNet-B3
+### Phase 2 — Improve best architecture
+Current best: dual-stream ResNet18 shared encoder = 98.55% balanced accuracy.
+- OneCycleLR, cosine warmup, learning rate tuning
+- Focal loss for hard examples (dataset is 93% positive / 7% negative)
+- Data augmentation: MixUp, CutMix, RandAugment
+- Test-Time Augmentation (TTA)
+- Larger backbones: ResNet50, EfficientNet-B0/B2
 
-### Phase 4 — Advanced
+### Phase 3 — Advanced approaches
+- Face embedding extraction (e.g. from pretrained face recognition model) + similarity scoring
 - CLIP embeddings + linear probe
-- Contrastive learning between far and near
-- Frequency domain features (DCT for screen detection)
-- Multi-task: predict attack type as auxiliary task
+- Multi-task: predict attack type (INJECT/SCREEN/DEEPFAKE) as auxiliary loss
+- Frequency domain features (DCT for screen replay detection)
+- Contrastive learning between far, near, and card
 
 ## Critical Rules
 
