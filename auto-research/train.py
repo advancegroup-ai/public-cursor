@@ -1,12 +1,15 @@
 """
-train.py — Liveness detection: Triple-stream ResNet18 + attention fusion + focal loss
+train.py — Liveness detection: Card-Face Verification + Dual-Stream Liveness
 
-Key innovations over current best (dual-stream 0.9855):
-1. Uses ALL 3 images: far + near + card (card never used in DL before)
-2. Attention-weighted fusion: learn which stream matters per sample
-3. Focal loss: better handle hard negatives (7% of data)
-4. Enhanced TTA: horizontal flip + center crop variants
-5. Pairwise cosine similarities as explicit comparison features
+This approach combines two complementary signals:
+1. LIVENESS BRANCH: Dual-stream ResNet18 for far+near (proven best at 0.9855)
+2. VERIFICATION BRANCH: Siamese comparison of face images vs card photo
+   - Learns if the face in far/near matches the face on the ID card
+   - Deepfake attacks (70% of negatives) have mismatched card vs face
+3. Outputs are fused for final prediction
+
+This should beat pure dual-stream because it adds the card comparison signal
+that human annotators use to catch deepfakes.
 """
 import os, sys, json, time, random
 import numpy as np
@@ -49,19 +52,6 @@ def load_labels():
                     main_label = "Negative"
                 labels[sig] = {"main_label": main_label, "pn": d["pn"]}
     return labels
-
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
-        p_t = torch.exp(-ce_loss)
-        focal_loss = ((1 - p_t) ** self.gamma) * ce_loss
-        return focal_loss.mean()
 
 
 class LivenessDatasetTriple(Dataset):
@@ -107,9 +97,6 @@ def load_data():
     valid_sigs = [s for s in labels if s in all_sigs
                   and (samples_dir / s / "far.jpg").exists()
                   and (samples_dir / s / "near.jpg").exists()]
-    # Also check for card.jpg, fall back gracefully
-    has_card = [(samples_dir / s / "card.jpg").exists() for s in valid_sigs]
-    print(f"Card image available: {sum(has_card)}/{len(valid_sigs)}")
     binary_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in valid_sigs]
     print(f"Total valid samples: {len(valid_sigs)}")
     print(f"Distribution: {Counter(binary_labels)}")
@@ -126,72 +113,68 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class AttentionFusion(nn.Module):
-    """Learnable attention weights over stream features."""
-    def __init__(self, feat_dim, num_streams=3):
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(feat_dim * num_streams, num_streams),
-        )
-        self.num_streams = num_streams
-        self.feat_dim = feat_dim
-
-    def forward(self, features_list):
-        # features_list: list of (B, feat_dim) tensors
-        concat = torch.cat(features_list, dim=1)  # (B, feat_dim * num_streams)
-        attn_logits = self.attention(concat)  # (B, num_streams)
-        attn_weights = F.softmax(attn_logits, dim=1)  # (B, num_streams)
-        stacked = torch.stack(features_list, dim=1)  # (B, num_streams, feat_dim)
-        attended = (stacked * attn_weights.unsqueeze(2)).sum(dim=1)  # (B, feat_dim)
-        return attended, attn_weights
-
-
-class TripleStreamAttentionNet(nn.Module):
+class CardFaceVerificationNet(nn.Module):
+    """
+    Two-branch architecture:
+    Branch A (Liveness): Dual-stream ResNet18 on far+near (proven best approach)
+    Branch B (Verification): Compare far/near features against card features
+    """
     def __init__(self, num_classes=2):
         super().__init__()
         base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.encoder = nn.Sequential(*list(base.children())[:-1])
+        self.face_encoder = nn.Sequential(*list(base.children())[:-1])
+        
+        card_base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.card_encoder = nn.Sequential(*list(card_base.children())[:-1])
+        
         feat_dim = 512
-
-        self.attention_fusion = AttentionFusion(feat_dim, num_streams=3)
-
-        # Attended feature (512) + raw concat (1536) + 3 pairwise diffs (1536) + 3 cosines
-        combined_dim = feat_dim + feat_dim * 3 + feat_dim * 3 + 3
-        self.classifier = nn.Sequential(
-            nn.BatchNorm1d(combined_dim),
-            nn.Dropout(0.4),
-            nn.Linear(combined_dim, 512),
-            nn.ReLU(),
-            nn.BatchNorm1d(512),
+        
+        # Branch A: Liveness (far + near)
+        liveness_dim = feat_dim * 2  # 1024
+        self.liveness_head = nn.Sequential(
+            nn.BatchNorm1d(liveness_dim),
             nn.Dropout(0.3),
-            nn.Linear(512, 128),
+            nn.Linear(liveness_dim, 256),
             nn.ReLU(),
+        )
+        
+        # Branch B: Verification features
+        # |far - card|, |near - card|, cosine(far, card), cosine(near, card)
+        verify_dim = feat_dim * 2 + 2  # 1026
+        self.verify_head = nn.Sequential(
+            nn.BatchNorm1d(verify_dim),
+            nn.Dropout(0.3),
+            nn.Linear(verify_dim, 128),
+            nn.ReLU(),
+        )
+        
+        self.final_classifier = nn.Sequential(
+            nn.BatchNorm1d(256 + 128),
             nn.Dropout(0.2),
-            nn.Linear(128, num_classes),
+            nn.Linear(256 + 128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_classes),
         )
 
     def forward(self, far, near, card):
-        f_far = self.encoder(far).flatten(1)
-        f_near = self.encoder(near).flatten(1)
-        f_card = self.encoder(card).flatten(1)
-
-        attended, attn_w = self.attention_fusion([f_far, f_near, f_card])
-
-        diff_fn = torch.abs(f_far - f_near)
-        diff_fc = torch.abs(f_far - f_card)
-        diff_nc = torch.abs(f_near - f_card)
-
-        cos_fn = F.cosine_similarity(f_far, f_near, dim=1, eps=1e-6).unsqueeze(1)
-        cos_fc = F.cosine_similarity(f_far, f_card, dim=1, eps=1e-6).unsqueeze(1)
-        cos_nc = F.cosine_similarity(f_near, f_card, dim=1, eps=1e-6).unsqueeze(1)
-
-        combined = torch.cat([
-            attended,
-            f_far, f_near, f_card,
-            diff_fn, diff_fc, diff_nc,
-            cos_fn, cos_fc, cos_nc
-        ], dim=1)
-        return self.classifier(combined)
+        f_far = self.face_encoder(far).flatten(1)
+        f_near = self.face_encoder(near).flatten(1)
+        f_card = self.card_encoder(card).flatten(1)
+        
+        # Branch A: Liveness
+        liveness_feat = torch.cat([f_far, f_near], dim=1)
+        liveness_out = self.liveness_head(liveness_feat)
+        
+        # Branch B: Verification
+        diff_far_card = torch.abs(f_far - f_card)
+        diff_near_card = torch.abs(f_near - f_card)
+        cos_far_card = F.cosine_similarity(f_far, f_card, dim=1, eps=1e-6).unsqueeze(1)
+        cos_near_card = F.cosine_similarity(f_near, f_card, dim=1, eps=1e-6).unsqueeze(1)
+        verify_feat = torch.cat([diff_far_card, diff_near_card, cos_far_card, cos_near_card], dim=1)
+        verify_out = self.verify_head(verify_feat)
+        
+        combined = torch.cat([liveness_out, verify_out], dim=1)
+        return self.final_classifier(combined)
 
 
 def train():
@@ -206,7 +189,6 @@ def train():
         T.RandomResizedCrop(224, scale=(0.8, 1.0)),
         T.RandomHorizontalFlip(),
         T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-        T.RandomGrayscale(p=0.05),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -221,19 +203,19 @@ def train():
     train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = TripleStreamAttentionNet().to(device)
+    model = CardFaceVerificationNet().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Triple-stream ResNet18 + attention fusion + pairwise, params: {num_params:,}")
+    print(f"Model: Card-Face Verification + Dual-stream liveness, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
 
-    epochs = 18
-    optimizer = torch.optim.AdamW(model.parameters(), lr=8e-5, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=6, T_mult=2, eta_min=1e-6)
+    epochs = 15
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     best_bal_acc = 0
     best_acc = 0
@@ -260,6 +242,7 @@ def train():
 
         scheduler.step()
 
+        # TTA: original + horizontal flip
         model.eval()
         all_probs, all_labels_list = [], []
         with torch.no_grad():
@@ -277,7 +260,7 @@ def train():
 
         all_probs = torch.cat(all_probs, dim=0)
         all_preds = all_probs.argmax(dim=1).numpy()
-        
+
         bal_acc = balanced_accuracy_score(all_labels_list, all_preds)
         acc = accuracy_score(all_labels_list, all_preds)
         f1 = f1_score(all_labels_list, all_preds, average="binary")
@@ -290,7 +273,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "triple_stream_resnet18_attention_fusion_focal_loss_pairwise_cosine_TTA"
+    approach = "card_face_verification_plus_dual_stream_liveness_resnet18_TTA"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
