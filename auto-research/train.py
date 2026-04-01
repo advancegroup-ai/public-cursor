@@ -1,9 +1,6 @@
 """
-train.py — Liveness detection: 9-channel (far+near+card) ResNet18 with AMP
-Key idea: Use ALL 3 images (far, near, card) as 9-channel input.
-The card image contains the reference face on the ID document.
-Attacks often have mismatches between the card face and far/near face.
-Using AMP + smaller batch for speed.
+train.py — Liveness detection: 9-channel (far+near+card) ResNet18, FAST version
+Key: Use all 3 images. AMP, 160px, 8 epochs, fast DataLoader. Target <180s.
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -25,6 +22,7 @@ DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research
 RESULTS_FILE = DATA_DIR / "last_result.json"
 SEED = 42
 MAX_SECONDS = 270
+IMG_SIZE = 160
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -55,7 +53,7 @@ class LivenessDataset9ch(Dataset):
             try:
                 img = Image.open(str(path)).convert("RGB")
             except Exception:
-                img = Image.new("RGB", (224, 224))
+                img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
             if self.transform:
                 img = self.transform(img)
             imgs.append(img)
@@ -77,8 +75,7 @@ def load_data():
             valid.append(sig)
 
     binary_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in valid]
-    print(f"Total valid samples: {len(valid)}")
-    print(f"Distribution: {Counter(binary_labels)}")
+    print(f"Total valid samples: {len(valid)}, Distribution: {Counter(binary_labels)}")
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     for fold_idx, (train_idx, test_idx) in enumerate(skf.split(valid, binary_labels)):
@@ -87,10 +84,7 @@ def load_data():
             test_ids = [valid[i] for i in test_idx]
             break
 
-    dist_train = Counter(labels[s]["main_label"] for s in train_ids)
-    dist_test = Counter(labels[s]["main_label"] for s in test_ids)
-    print(f"Train: {len(train_ids)} {dict(dist_train)}")
-    print(f"Test:  {len(test_ids)} {dict(dist_test)}")
+    print(f"Train: {len(train_ids)}, Test: {len(test_ids)}")
     return train_ids, test_ids, labels
 
 
@@ -107,7 +101,6 @@ class FocalLoss(nn.Module):
 
 
 def build_model_9ch(num_classes=2):
-    """ResNet18 pretrained, modified for 9-channel input (far+near+card concat)."""
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     old_conv = model.conv1
     model.conv1 = nn.Conv2d(9, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -131,15 +124,14 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((256, 256)),
-        T.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        T.Resize((IMG_SIZE, IMG_SIZE)),
         T.RandomHorizontalFlip(),
         T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
     transform_test = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((IMG_SIZE, IMG_SIZE)),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -147,12 +139,12 @@ def train():
     train_ds = LivenessDataset9ch(train_ids, labels, transform_train)
     test_ds = LivenessDataset9ch(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=48, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=4, pin_memory=True)
 
     model = build_model_9ch().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 (9-ch far+near+card), params: {num_params:,}")
+    print(f"Model: ResNet18 9ch, params: {num_params:,}")
 
     train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels_list)
@@ -160,19 +152,12 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = FocalLoss(alpha=weight.to(device), gamma=1.5)
 
-    epochs = 12
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
-
-    total_steps = epochs * len(train_loader)
-    warmup_steps = len(train_loader)
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    epochs = 8
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=3e-4, epochs=epochs, steps_per_epoch=len(train_loader),
+        pct_start=0.2, div_factor=10, final_div_factor=100
+    )
     scaler = GradScaler()
 
     best_bal_acc = 0
@@ -217,7 +202,8 @@ def train():
         acc = accuracy_score(all_labels_list, all_preds)
         f1v = f1_score(all_labels_list, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1v:.4f}")
+        elapsed_now = time.time() - t0
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1v:.4f} [{elapsed_now:.0f}s]")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
@@ -225,7 +211,7 @@ def train():
             best_f1 = f1v
 
     elapsed = time.time() - t0
-    approach = "resnet18_9ch_far_near_card_AMP_focal_TTA_warmup_cosine"
+    approach = "resnet18_9ch_far_near_card_AMP_focal_TTA_onecycle_160px"
 
     result_block = (
         f"\n---\n"
