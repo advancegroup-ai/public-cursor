@@ -1,6 +1,9 @@
 """
-train.py — Liveness detection: 9-channel (far+near+card) ResNet18, FAST version
-Key: Use all 3 images. AMP, 160px, 8 epochs, fast DataLoader. Target <180s.
+train.py — Liveness detection: 3-stream ResNet18 (far, near, card) with separate encoders
+Key idea: Separate encoders for each image stream to learn stream-specific features,
+then fuse via concatenation + MLP classifier.
+Card stream can learn ID document specific features.
+AMP, 160px, 8 epochs for speed.
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -32,7 +35,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
 
-class LivenessDataset9ch(Dataset):
+class LivenessDataset3Stream(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
@@ -58,8 +61,7 @@ class LivenessDataset9ch(Dataset):
                 img = self.transform(img)
             imgs.append(img)
 
-        combined = torch.cat(imgs, dim=0)  # 9-channel
-        return combined, label
+        return imgs[0], imgs[1], imgs[2], label
 
 
 def load_data():
@@ -100,20 +102,34 @@ class FocalLoss(nn.Module):
         return ((1 - pt) ** self.gamma * ce).mean()
 
 
-def build_model_9ch(num_classes=2):
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-    old_conv = model.conv1
-    model.conv1 = nn.Conv2d(9, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    with torch.no_grad():
-        model.conv1.weight[:, :3] = old_conv.weight
-        model.conv1.weight[:, 3:6] = old_conv.weight
-        model.conv1.weight[:, 6:9] = old_conv.weight
+class ThreeStreamModel(nn.Module):
+    """Three separate ResNet18 encoders (far, near, card) → concat → classifier."""
+    def __init__(self, num_classes=2):
+        super().__init__()
+        self.far_encoder = self._make_encoder()
+        self.near_encoder = self._make_encoder()
+        self.card_encoder = self._make_encoder()
 
-    model.fc = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(model.fc.in_features, num_classes),
-    )
-    return model
+        feat_dim = 512 * 3
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(feat_dim),
+            nn.Dropout(0.4),
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes),
+        )
+
+    def _make_encoder(self):
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        return nn.Sequential(*list(base.children())[:-1])
+
+    def forward(self, far, near, card):
+        f_far = self.far_encoder(far).flatten(1)
+        f_near = self.near_encoder(near).flatten(1)
+        f_card = self.card_encoder(card).flatten(1)
+        combined = torch.cat([f_far, f_near, f_card], dim=1)
+        return self.classifier(combined)
 
 
 def train():
@@ -136,15 +152,15 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = LivenessDataset9ch(train_ids, labels, transform_train)
-    test_ds = LivenessDataset9ch(test_ids, labels, transform_test)
+    train_ds = LivenessDataset3Stream(train_ids, labels, transform_train)
+    test_ds = LivenessDataset3Stream(test_ids, labels, transform_test)
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = build_model_9ch().to(device)
+    model = ThreeStreamModel().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 9ch, params: {num_params:,}")
+    print(f"Model: 3-stream ResNet18 (far+near+card), params: {num_params:,}")
 
     train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels_list)
@@ -153,9 +169,9 @@ def train():
     criterion = FocalLoss(alpha=weight.to(device), gamma=1.5)
 
     epochs = 8
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=3e-4, epochs=epochs, steps_per_epoch=len(train_loader),
+        optimizer, max_lr=2e-4, epochs=epochs, steps_per_epoch=len(train_loader),
         pct_start=0.2, div_factor=10, final_div_factor=100
     )
     scaler = GradScaler()
@@ -171,11 +187,12 @@ def train():
 
         model.train()
         total_loss = 0
-        for imgs, targets in train_loader:
-            imgs, targets = imgs.to(device), targets.to(device)
+        for far, near, card, targets in train_loader:
+            far, near, card = far.to(device), near.to(device), card.to(device)
+            targets = targets.to(device)
             optimizer.zero_grad()
             with autocast():
-                out = model(imgs)
+                out = model(far, near, card)
                 loss = criterion(out, targets)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -188,11 +205,11 @@ def train():
         model.eval()
         all_preds, all_labels_list = [], []
         with torch.no_grad():
-            for imgs, targets in test_loader:
-                imgs = imgs.to(device)
+            for far, near, card, targets in test_loader:
+                far, near, card = far.to(device), near.to(device), card.to(device)
                 with autocast():
-                    out1 = model(imgs)
-                    out2 = model(torch.flip(imgs, dims=[3]))
+                    out1 = model(far, near, card)
+                    out2 = model(torch.flip(far, dims=[3]), torch.flip(near, dims=[3]), torch.flip(card, dims=[3]))
                 out = (out1 + out2) / 2.0
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
@@ -211,7 +228,7 @@ def train():
             best_f1 = f1v
 
     elapsed = time.time() - t0
-    approach = "resnet18_9ch_far_near_card_AMP_focal_TTA_onecycle_160px"
+    approach = "3stream_resnet18_far_near_card_separate_encoders_AMP_focal_TTA"
 
     result_block = (
         f"\n---\n"
