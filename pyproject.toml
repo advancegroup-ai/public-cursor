@@ -1,0 +1,36 @@
+ [project]
+ name = "forgery-detection"
+ version = "0.1.0"
+ description = "Utilities for document forgery analysis (embeddings, joins, clustering)."
+ readme = "README.md"
+ requires-python = ">=3.10"
+ dependencies = [
+   "numpy>=1.26",
+ ]
+ 
+ [project.optional-dependencies]
+ onnx = ["onnxruntime>=1.17"]
+ vision = ["opencv-python>=4.8", "pillow>=10.0"]
+ face = ["insightface>=0.7.3"]
+ dev = ["pytest>=8.0", "ruff>=0.3.0"]
+ 
+ [project.scripts]
+ forgery-npz-join = "forgery_detection.cli.npz_join:main"
+ forgery-cluster = "forgery_detection.cli.cluster:main"
+ 
+ [build-system]
+ requires = ["setuptools>=68"]
+ build-backend = "setuptools.build_meta"
+ 
+ [tool.setuptools]
+ package-dir = {"" = "src"}
+ 
+ [tool.ruff]
+ line-length = 100
+ target-version = "py310"
+ 
+ [tool.ruff.lint]
+ select = ["E", "F", "I", "B", "UP"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
