@@ -1,48 +1,54 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-
-This is the file the Cloud Agent modifies. It runs on DGX1 with:
-- 4x V100-32GB, PyTorch 2.4.0+cu121
-- NAS access: /mnt/nas/public2/simon/projects/auto_research/liveness-research/data/
-
-Output format (must print exactly):
----
-balanced_accuracy: 0.XXXX
-accuracy:          0.XXXX
-f1_score:          0.XXXX
-num_params:        NNNNN
-training_seconds:  NNN.N
-approach:          description_here
----
+Experiment: Dual-stream ResNet18 with shared weights (proper 3-ch RGB inputs)
+Each image (far, near) goes through the same pretrained ResNet18 encoder.
+Features are concatenated and fed to an MLP classifier.
+This preserves pretrained weights better than 6-channel hack.
 """
-import os
-import sys
-import json
-import time
-import random
+import os, sys, json, time, random
 import numpy as np
 from pathlib import Path
 from collections import Counter
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
+from sklearn.model_selection import StratifiedKFold
 
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
-RESULTS_FILE = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/last_result.json")
+RESULTS_FILE = DATA_DIR / "last_result.json"
 SEED = 42
-MAX_SECONDS = 270  # leave margin within 5-min budget
+MAX_SECONDS = 270
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 
-class LivenessDataset(Dataset):
+def load_labels():
+    labels = {}
+    for fname in ["neg_batch.json", "pos_batch.json"]:
+        with open(str(DATA_DIR / fname)) as f:
+            batch = json.load(f)
+        for d in batch.get("data", []):
+            parts = d["sample_id"].split("_")
+            if len(parts) >= 4:
+                sig = parts[3]
+                main_label = d["pn"].split("/")[0]
+                if main_label in ("Negative Type", "Negative_Type"):
+                    main_label = "Negative"
+                labels[sig] = {"main_label": main_label, "pn": d["pn"]}
+    return labels
+
+
+class LivenessDatasetDual(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
@@ -56,65 +62,62 @@ class LivenessDataset(Dataset):
         sig = self.sig_ids[idx]
         info = self.labels[sig]
         label = 0 if info["main_label"] == "Positive" else 1
-
         far_path = self.samples_dir / sig / "far.jpg"
         near_path = self.samples_dir / sig / "near.jpg"
-
         try:
             far_img = Image.open(str(far_path)).convert("RGB")
             near_img = Image.open(str(near_path)).convert("RGB")
         except Exception:
-            # Return a black placeholder for corrupted images
             far_img = Image.new("RGB", (224, 224))
             near_img = Image.new("RGB", (224, 224))
-
         if self.transform:
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
-
-        img = torch.cat([far_img, near_img], dim=0)  # 6-channel input
-        return img, label
+        return far_img, near_img, label
 
 
 def load_data():
-    with open(str(DATA_DIR / "labels.json")) as f:
-        labels = json.load(f)
-
-    # Filter valid samples
-    valid = []
-    for sig, info in labels.items():
-        far = DATA_DIR / "samples" / sig / "far.jpg"
-        near = DATA_DIR / "samples" / sig / "near.jpg"
-        if far.exists() and near.exists():
-            valid.append(sig)
-
-    random.shuffle(valid)
-    split = int(len(valid) * 0.8)
-    train_ids = valid[:split]
-    test_ids = valid[split:]
-
+    labels = load_labels()
+    samples_dir = DATA_DIR / "samples"
+    all_sigs = set(os.listdir(str(samples_dir)))
+    valid_sigs = [s for s in labels if s in all_sigs
+                  and (samples_dir / s / "far.jpg").exists()
+                  and (samples_dir / s / "near.jpg").exists()]
+    binary_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in valid_sigs]
+    print(f"Total valid samples: {len(valid_sigs)}")
+    print(f"Distribution: {Counter(binary_labels)}")
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(valid_sigs, binary_labels)):
+        if fold_idx == 0:
+            train_ids = [valid_sigs[i] for i in train_idx]
+            test_ids = [valid_sigs[i] for i in test_idx]
+            break
     dist_train = Counter(labels[s]["main_label"] for s in train_ids)
     dist_test = Counter(labels[s]["main_label"] for s in test_ids)
     print(f"Train: {len(train_ids)} {dict(dist_train)}")
     print(f"Test:  {len(test_ids)} {dict(dist_test)}")
-
     return train_ids, test_ids, labels
 
 
-def build_model(num_classes=2):
-    """ResNet18 pretrained, modified for 6-channel input (far+near concat)."""
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+class DualStreamResNet(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.encoder = nn.Sequential(*list(base.children())[:-1])  # up to avgpool
+        feat_dim = 512
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(feat_dim * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes),
+        )
 
-    # Modify first conv to accept 6 channels
-    old_conv = model.conv1
-    model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    with torch.no_grad():
-        # Init: duplicate pretrained 3-ch weights for both far and near
-        model.conv1.weight[:, :3] = old_conv.weight
-        model.conv1.weight[:, 3:] = old_conv.weight
-
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    return model
+    def forward(self, far, near):
+        f_far = self.encoder(far).flatten(1)   # (B, 512)
+        f_near = self.encoder(near).flatten(1)  # (B, 512)
+        combined = torch.cat([f_far, f_near], dim=1)  # (B, 1024)
+        return self.classifier(combined)
 
 
 def train():
@@ -125,9 +128,10 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((256, 256)),
+        T.RandomResizedCrop(224, scale=(0.8, 1.0)),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -137,63 +141,65 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = LivenessDataset(train_ids, labels, transform_train)
-    test_ds = LivenessDataset(test_ids, labels, transform_test)
-
+    train_ds = LivenessDatasetDual(train_ids, labels, transform_train)
+    test_ds = LivenessDatasetDual(test_ids, labels, transform_test)
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = build_model().to(device)
+    model = DualStreamResNet().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: ResNet18 (6-ch), params: {num_params:,}")
+    print(f"Model: Dual-stream ResNet18 shared encoder (3-ch RGB), params: {num_params:,}")
 
-    # Weighted loss for class imbalance
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
     criterion = nn.CrossEntropyLoss(weight=weight.to(device))
 
+    epochs = 15
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # Train
     best_bal_acc = 0
-    epochs = 10
+    best_acc = 0
+    best_f1 = 0
+
     for epoch in range(epochs):
-        if time.time() - t0 > MAX_SECONDS:
-            print(f"Time budget reached at epoch {epoch}")
+        if time.time() - t0 > MAX_SECONDS - 30:
+            print(f"Time budget approaching at epoch {epoch}")
             break
 
         model.train()
         total_loss = 0
-        for imgs, targets in train_loader:
-            imgs, targets = imgs.to(device), targets.to(device)
+        for far, near, targets in train_loader:
+            far, near, targets = far.to(device), near.to(device), targets.to(device)
             optimizer.zero_grad()
-            out = model(imgs)
+            out = model(far, near)
             loss = criterion(out, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
 
         scheduler.step()
 
-        # Eval
+        # Eval with TTA (horizontal flip)
         model.eval()
-        all_preds, all_labels = [], []
+        all_preds, all_labels_list = [], []
         with torch.no_grad():
-            for imgs, targets in test_loader:
-                imgs = imgs.to(device)
-                out = model(imgs)
+            for far, near, targets in test_loader:
+                far, near = far.to(device), near.to(device)
+                out1 = model(far, near)
+                out2 = model(torch.flip(far, dims=[3]), torch.flip(near, dims=[3]))
+                out = (out1 + out2) / 2
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
-                all_labels.extend(targets.numpy())
+                all_labels_list.extend(targets.numpy())
 
-        bal_acc = balanced_accuracy_score(all_labels, all_preds)
-        acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average="binary")
+        bal_acc = balanced_accuracy_score(all_labels_list, all_preds)
+        acc = accuracy_score(all_labels_list, all_preds)
+        f1 = f1_score(all_labels_list, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
-
         print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
 
         if bal_acc > best_bal_acc:
@@ -202,8 +208,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-
-    # Output in required format (both print and write to file for pipeline compatibility)
+    approach = "dual_stream_resnet18_shared_encoder_3ch_rgb_TTA"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
@@ -211,24 +216,22 @@ def train():
         f"f1_score:          {best_f1:.6f}\n"
         f"num_params:        {num_params}\n"
         f"training_seconds:  {elapsed:.1f}\n"
-        f"approach:          resnet18_pretrained_6ch_far_near\n"
+        f"approach:          {approach}\n"
         f"---\n"
     )
     print(result_block)
-    
-    # Also write to file (pipeline stdout capture is unreliable)
+
     result_data = {
         "balanced_accuracy": best_bal_acc,
         "accuracy": best_acc,
         "f1_score": best_f1,
         "num_params": num_params,
         "training_seconds": elapsed,
-        "approach": "resnet18_pretrained_6ch_far_near",
+        "approach": approach,
     }
     with open(str(RESULTS_FILE), "w") as rf:
         json.dump(result_data, rf, indent=2)
     print(f"Results written to {RESULTS_FILE}")
 
 
-# Always run when executed (pipeline uses exec(), not __main__)
 train()
