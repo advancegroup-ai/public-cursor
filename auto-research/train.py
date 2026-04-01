@@ -1,13 +1,21 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: Triple-stream ResNet18 shared encoder (far + near + card) with
-ATTENTION-based fusion + cosine LR + TTA.
+Experiment: Triple-stream ResNet18 shared encoder (far + near + card)
+with cross-stream difference features + cosine LR + TTA.
 
-Key innovations vs previous best (dual-stream, 0.9855):
-1. Uses ALL 3 images (far, near, card) — previous best only used 2
-2. Cross-attention module learns to weight face-card similarity
-3. Explicit difference features capture face-card inconsistency
-4. Channel attention (SE-like) on fused features for feature selection
+RATIONALE: Current best (0.9855) only uses far+near. But 70% of attacks are
+deepfake injection where the face doesn't match the ID card. Adding the card
+stream with explicit face-card difference features should capture this signal.
+
+Design choices:
+- Shared ResNet18 encoder (works better than separate, proven in iter results)
+- Cross-stream differences: far-card, near-card, far-near (captures inconsistency)
+- Element-wise product: far*card, near*card (captures similarity patterns)
+- BatchNorm + moderate dropout (prevents overfitting on small dataset)
+- Focal loss + class weights (handles 93/7 imbalance)
+- CosineAnnealingLR (proven effective in best results)
+- TTA with horizontal flip (proven effective)
+- AdamW with moderate LR and weight decay
 """
 import os, sys, json, time, random
 import numpy as np
@@ -111,106 +119,6 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block for channel attention."""
-    def __init__(self, channels, reduction=8):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        w = self.fc(x)
-        return x * w
-
-
-class CrossAttentionFusion(nn.Module):
-    """Simple cross-attention: use card features as query to attend to face features."""
-    def __init__(self, dim=512, heads=4):
-        super().__init__()
-        self.heads = heads
-        self.scale = (dim // heads) ** -0.5
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-
-    def forward(self, query, key_value):
-        B = query.shape[0]
-        q = self.q_proj(query).unsqueeze(1)   # (B, 1, D)
-        k = self.k_proj(key_value).unsqueeze(1)  # (B, 1, D)
-        v = self.v_proj(key_value).unsqueeze(1)   # (B, 1, D)
-
-        h = self.heads
-        d = q.shape[-1] // h
-        q = q.view(B, 1, h, d).transpose(1, 2)  # (B, h, 1, d)
-        k = k.view(B, 1, h, d).transpose(1, 2)
-        v = v.view(B, 1, h, d).transpose(1, 2)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, 1, -1)
-        return self.out_proj(out.squeeze(1))
-
-
-class TripleStreamAttentionNet(nn.Module):
-    """
-    Triple-stream with shared ResNet18 encoder.
-    Features:
-    - 3 stream outputs (far, near, card) each 512-d
-    - Cross-attention: card queries each face stream
-    - Difference features: far-card, near-card, far-near
-    - SE attention on final fused features
-    """
-    def __init__(self, num_classes=2):
-        super().__init__()
-        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.encoder = nn.Sequential(*list(base.children())[:-1])
-        feat_dim = 512
-
-        self.card_far_attn = CrossAttentionFusion(feat_dim, heads=4)
-        self.card_near_attn = CrossAttentionFusion(feat_dim, heads=4)
-
-        # 3 raw + 3 diffs + 2 cross-attn = 8 * 512 = 4096
-        fused_dim = feat_dim * 8
-        self.se = SEBlock(fused_dim, reduction=16)
-        self.classifier = nn.Sequential(
-            nn.BatchNorm1d(fused_dim),
-            nn.Dropout(0.4),
-            nn.Linear(fused_dim, 512),
-            nn.GELU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(0.2),
-            nn.Linear(512, 128),
-            nn.GELU(),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, far, near, card):
-        f_far = self.encoder(far).flatten(1)
-        f_near = self.encoder(near).flatten(1)
-        f_card = self.encoder(card).flatten(1)
-
-        attn_card_far = self.card_far_attn(f_card, f_far)
-        attn_card_near = self.card_near_attn(f_card, f_near)
-
-        diff_far_card = f_far - f_card
-        diff_near_card = f_near - f_card
-        diff_far_near = f_far - f_near
-
-        combined = torch.cat([
-            f_far, f_near, f_card,
-            diff_far_card, diff_near_card, diff_far_near,
-            attn_card_far, attn_card_near,
-        ], dim=1)
-
-        combined = self.se(combined)
-        return self.classifier(combined)
-
-
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2.0):
         super().__init__()
@@ -222,6 +130,57 @@ class FocalLoss(nn.Module):
         pt = torch.exp(-ce_loss)
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
         return focal_loss.mean()
+
+
+class TripleStreamResNet(nn.Module):
+    """
+    Triple-stream with shared ResNet18 encoder.
+    
+    Feature fusion:
+    - 3 raw streams: far(512), near(512), card(512) = 1536
+    - 3 difference vectors: far-card(512), near-card(512), far-near(512) = 1536
+    - 2 product vectors: far*card(512), near*card(512) = 1024
+    Total: 4096
+    
+    Products capture correlation patterns while differences capture inconsistency.
+    """
+    def __init__(self, num_classes=2):
+        super().__init__()
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.encoder = nn.Sequential(*list(base.children())[:-1])
+        feat_dim = 512
+        fused_dim = feat_dim * 8  # 3 raw + 3 diff + 2 product
+
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(fused_dim),
+            nn.Dropout(0.3),
+            nn.Linear(fused_dim, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, far, near, card):
+        f_far = self.encoder(far).flatten(1)
+        f_near = self.encoder(near).flatten(1)
+        f_card = self.encoder(card).flatten(1)
+
+        diff_far_card = f_far - f_card
+        diff_near_card = f_near - f_card
+        diff_far_near = f_far - f_near
+        prod_far_card = f_far * f_card
+        prod_near_card = f_near * f_card
+
+        combined = torch.cat([
+            f_far, f_near, f_card,
+            diff_far_card, diff_near_card, diff_far_near,
+            prod_far_card, prod_near_card,
+        ], dim=1)
+
+        return self.classifier(combined)
 
 
 def train():
@@ -236,7 +195,6 @@ def train():
         T.RandomResizedCrop(224, scale=(0.8, 1.0)),
         T.RandomHorizontalFlip(),
         T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-        T.RandomGrayscale(p=0.05),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -248,12 +206,12 @@ def train():
 
     train_ds = LivenessDatasetTriple(train_ids, labels, transform_train)
     test_ds = LivenessDatasetTriple(test_ids, labels, transform_test)
-    train_loader = DataLoader(train_ds, batch_size=20, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=40, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = TripleStreamAttentionNet().to(device)
+    model = TripleStreamResNet().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Triple-stream ResNet18 + cross-attention + SE fusion, params: {num_params:,}")
+    print(f"Model: Triple-stream ResNet18 shared + diffs + products, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
@@ -262,8 +220,8 @@ def train():
     criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
     epochs = 15
-    optimizer = torch.optim.AdamW(model.parameters(), lr=8e-5, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     best_bal_acc = 0
     best_acc = 0
@@ -289,7 +247,7 @@ def train():
         scheduler.step()
 
         model.eval()
-        all_preds, all_labels_list, all_probs = [], [], []
+        all_preds, all_labels_list = [], []
         with torch.no_grad():
             for far, near, card, targets in test_loader:
                 far, near, card = far.to(device), near.to(device), card.to(device)
@@ -300,11 +258,9 @@ def train():
                     torch.flip(card, dims=[3])
                 )
                 out = (out1 + out2) / 2
-                probs = F.softmax(out, dim=1)
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels_list.extend(targets.numpy())
-                all_probs.extend(probs[:, 1].cpu().numpy())
 
         bal_acc = balanced_accuracy_score(all_labels_list, all_preds)
         acc = accuracy_score(all_labels_list, all_preds)
@@ -318,7 +274,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "triple_stream_resnet18_cross_attention_SE_focal_TTA"
+    approach = "triple_stream_resnet18_shared_diffs_products_focal_cosLR_TTA"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
