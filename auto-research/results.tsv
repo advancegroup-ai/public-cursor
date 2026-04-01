@@ -45,3 +45,10 @@ b8dbff8	N/A	blocked	[DGX1] Dual-stream ResNet18 shared + MixUp + label smoothing
 9491929	N/A	blocked	[DGX1] Dual-stream ResNet18 shared + cross-attention feature fusion + focal loss + diff LR + TTA
 ac0d26e	N/A	blocked	[DGX1] Triple-stream (far+near+diff) ResNet18 shared + gated fusion + focal loss + TTA
 c78e45a	N/A	blocked	[DGX1] Dual EfficientNet-V2-S shared + GeM pooling + focal loss + AMP + diff LR + TTA
+--- iter32 experiments (token expired after ~10min, SSL timeouts on long jobs, 5 experiments prepared) ---
+2e42441	N/A	blocked	[DGX1] 9ch ResNet18 (far+near+card) + AMP + focal + TTA + OneCycle + 160px
+20d7b2c	N/A	blocked	[DGX1] 9ch ResNet18 fast version (160px, 8 epochs, AMP, focal, TTA)
+214fed2	N/A	blocked	[DGX1] 3-stream ResNet18 separate encoders (far+near+card) + AMP + focal + TTA
+e28a352	N/A	blocked	[DGX1] Shared ResNet18 3-image + card verification (cosine diff) + AMP + focal + TTA
+1a4e929	N/A	blocked	[DGX1] Cross-attention ResNet18 (face queries × card keys) + AMP + focal + TTA
+aa94bf2	N/A	set	[DGX1] Hybrid 3-img card verify + cosine diff + handcrafted noise/FFT + AMP + focal + TTA (BEST CANDIDATE)
