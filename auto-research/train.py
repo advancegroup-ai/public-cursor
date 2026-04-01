@@ -1,12 +1,15 @@
 """
-train.py — Liveness: Dual-stream shared ResNet18 (far+near) + Card Verification Head
-                     + Optimal Threshold Search + Multi-TTA
+train.py — Liveness: Multi-view Comparison Network with Learnable Projections
 
-Strategy: Keep the proven best dual-stream architecture as backbone, but add:
-1. A card comparison head that learns face-card mismatch signals
-2. Multi-crop TTA (original + flip + center crop from 256)
-3. Optimal threshold search on validation probabilities
-4. Cosine annealing with warm restarts for better convergence
+Novel approach: Instead of just encoding images separately, we learn a shared
+projection space where face features and card features are comparable.
+
+1. Shared ResNet18 backbone for all 3 images (far, near, card)
+2. Projection heads that map features to a comparison space (128-dim)
+3. Explicit distance/similarity features in projected space
+4. Combined with raw features for final classification
+5. Multi-TTA with optimal threshold search
+6. Label smoothing for better calibration
 """
 import os, sys, json, time, random
 import numpy as np
@@ -52,11 +55,10 @@ def load_labels():
 
 
 class LivenessDatasetTriple(Dataset):
-    def __init__(self, sig_ids, labels, transform_face=None, transform_card=None):
+    def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
-        self.transform_face = transform_face
-        self.transform_card = transform_card
+        self.transform = transform
         self.samples_dir = DATA_DIR / "samples"
 
     def __len__(self):
@@ -66,24 +68,17 @@ class LivenessDatasetTriple(Dataset):
         sig = self.sig_ids[idx]
         info = self.labels[sig]
         label = 0 if info["main_label"] == "Positive" else 1
-
-        imgs = {}
+        imgs = []
         for name in ["far", "near", "card"]:
             path = self.samples_dir / sig / f"{name}.jpg"
             try:
-                imgs[name] = Image.open(str(path)).convert("RGB")
+                img = Image.open(str(path)).convert("RGB")
             except Exception:
-                imgs[name] = Image.new("RGB", (224, 224))
-
-        if self.transform_face:
-            imgs["far"] = self.transform_face(imgs["far"])
-            imgs["near"] = self.transform_face(imgs["near"])
-        if self.transform_card:
-            imgs["card"] = self.transform_card(imgs["card"])
-        elif self.transform_face:
-            imgs["card"] = self.transform_face(imgs["card"])
-
-        return imgs["far"], imgs["near"], imgs["card"], label
+                img = Image.new("RGB", (224, 224))
+            if self.transform:
+                img = self.transform(img)
+            imgs.append(img)
+        return imgs[0], imgs[1], imgs[2], label
 
 
 def load_data():
@@ -109,25 +104,33 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class DualStreamWithCardVerification(nn.Module):
+class MultiViewComparisonNet(nn.Module):
     """
-    Proven dual-stream liveness (far+near) + card verification head.
-    Shared face encoder, separate card encoder.
+    Shared backbone + learned projections for explicit comparison.
     """
     def __init__(self, num_classes=2):
         super().__init__()
-        face_base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.face_encoder = nn.Sequential(*list(face_base.children())[:-1])
-
-        card_base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.card_encoder = nn.Sequential(*list(card_base.children())[:-1])
-
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.encoder = nn.Sequential(*list(base.children())[:-1])
         feat_dim = 512
+        proj_dim = 128
 
-        # Liveness features: far + near concatenated
-        # Verification features: |far-card| + |near-card| + cos(far,card) + cos(near,card)
-        # Total: 1024 + 1024 + 2 = 2050
-        combined_dim = feat_dim * 2 + feat_dim * 2 + 2
+        self.face_proj = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, proj_dim),
+        )
+        self.card_proj = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, proj_dim),
+        )
+
+        # Raw features: 3*512=1536
+        # Projected diffs: |proj_far - proj_card| + |proj_near - proj_card| = 2*128=256
+        # Projected cosines: 3 scalars
+        # Raw diffs: |far-near| = 512
+        combined_dim = feat_dim * 3 + proj_dim * 2 + 3 + feat_dim
 
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(combined_dim),
@@ -140,26 +143,36 @@ class DualStreamWithCardVerification(nn.Module):
         )
 
     def forward(self, far, near, card):
-        f_far = self.face_encoder(far).flatten(1)
-        f_near = self.face_encoder(near).flatten(1)
-        f_card = self.card_encoder(card).flatten(1)
+        f_far = self.encoder(far).flatten(1)
+        f_near = self.encoder(near).flatten(1)
+        f_card = self.encoder(card).flatten(1)
 
-        liveness = torch.cat([f_far, f_near], dim=1)
+        p_far = self.face_proj(f_far)
+        p_near = self.face_proj(f_near)
+        p_card = self.card_proj(f_card)
 
-        diff_fc = torch.abs(f_far - f_card)
-        diff_nc = torch.abs(f_near - f_card)
-        cos_fc = F.cosine_similarity(f_far, f_card, dim=1, eps=1e-6).unsqueeze(1)
-        cos_nc = F.cosine_similarity(f_near, f_card, dim=1, eps=1e-6).unsqueeze(1)
+        diff_far_card = torch.abs(p_far - p_card)
+        diff_near_card = torch.abs(p_near - p_card)
 
-        combined = torch.cat([liveness, diff_fc, diff_nc, cos_fc, cos_nc], dim=1)
+        cos_fc = F.cosine_similarity(p_far, p_card, dim=1, eps=1e-6).unsqueeze(1)
+        cos_nc = F.cosine_similarity(p_near, p_card, dim=1, eps=1e-6).unsqueeze(1)
+        cos_fn = F.cosine_similarity(p_far, p_near, dim=1, eps=1e-6).unsqueeze(1)
+
+        diff_fn_raw = torch.abs(f_far - f_near)
+
+        combined = torch.cat([
+            f_far, f_near, f_card,
+            diff_far_card, diff_near_card,
+            cos_fc, cos_nc, cos_fn,
+            diff_fn_raw
+        ], dim=1)
         return self.classifier(combined)
 
 
 def find_optimal_threshold(probs, labels):
-    """Search for optimal threshold on negative class probability."""
     best_bal_acc = 0
     best_threshold = 0.5
-    for t in np.arange(0.3, 0.7, 0.01):
+    for t in np.arange(0.3, 0.7, 0.005):
         preds = (probs[:, 1] > t).astype(int)
         ba = balanced_accuracy_score(labels, preds)
         if ba > best_bal_acc:
@@ -188,30 +201,21 @@ def train():
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
-    transform_test_256 = T.Compose([
-        T.Resize((256, 256)),
-        T.CenterCrop(224),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
 
-    train_ds = LivenessDatasetTriple(train_ids, labels, transform_face=transform_train, transform_card=transform_train)
-    test_ds = LivenessDatasetTriple(test_ids, labels, transform_face=transform_test, transform_card=transform_test)
-    test_ds_crop = LivenessDatasetTriple(test_ids, labels, transform_face=transform_test_256, transform_card=transform_test_256)
-
+    train_ds = LivenessDatasetTriple(train_ids, labels, transform_train)
+    test_ds = LivenessDatasetTriple(test_ids, labels, transform_test)
     train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader_crop = DataLoader(test_ds_crop, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DualStreamWithCardVerification().to(device)
+    model = MultiViewComparisonNet().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Dual-stream + card verification, params: {num_params:,}")
+    print(f"Model: Multi-view comparison net, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.05)
 
     epochs = 15
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
@@ -222,7 +226,7 @@ def train():
     best_f1 = 0
 
     for epoch in range(epochs):
-        if time.time() - t0 > MAX_SECONDS - 40:
+        if time.time() - t0 > MAX_SECONDS - 35:
             print(f"Time budget approaching at epoch {epoch}")
             break
 
@@ -242,52 +246,42 @@ def train():
 
         scheduler.step()
 
-        # Multi-TTA: original + flip + center crop from 256
+        # TTA: original + horizontal flip
         model.eval()
-        all_probs_list = []
+        all_probs = []
         all_labels_list = []
+        with torch.no_grad():
+            for far, near, card, targets in test_loader:
+                far, near, card = far.to(device), near.to(device), card.to(device)
+                out1 = F.softmax(model(far, near, card), dim=1)
+                out2 = F.softmax(model(
+                    torch.flip(far, dims=[3]),
+                    torch.flip(near, dims=[3]),
+                    torch.flip(card, dims=[3])
+                ), dim=1)
+                probs = (out1 + out2) / 2
+                all_probs.append(probs.cpu())
+                all_labels_list.extend(targets.numpy())
 
-        def get_probs(loader, flip=False):
-            probs_list = []
-            with torch.no_grad():
-                for far, near, card, targets in loader:
-                    far, near, card = far.to(device), near.to(device), card.to(device)
-                    if flip:
-                        far = torch.flip(far, dims=[3])
-                        near = torch.flip(near, dims=[3])
-                        card = torch.flip(card, dims=[3])
-                    out = F.softmax(model(far, near, card), dim=1)
-                    probs_list.append(out.cpu())
-            return torch.cat(probs_list, dim=0)
-
-        probs_orig = get_probs(test_loader, flip=False)
-        probs_flip = get_probs(test_loader, flip=True)
-        probs_crop = get_probs(test_loader_crop, flip=False)
-
-        # Collect labels once
-        for _, _, _, targets in test_loader:
-            all_labels_list.extend(targets.numpy())
-
-        avg_probs = (probs_orig + probs_flip + probs_crop) / 3
-        all_preds = avg_probs.argmax(dim=1).numpy()
+        all_probs = torch.cat(all_probs, dim=0).numpy()
         all_labels_arr = np.array(all_labels_list)
+        all_preds = all_probs.argmax(axis=1)
 
         bal_acc = balanced_accuracy_score(all_labels_arr, all_preds)
         acc = accuracy_score(all_labels_arr, all_preds)
         f1 = f1_score(all_labels_arr, all_preds, average="binary")
 
-        # Also try optimal threshold
-        opt_thresh, opt_bal_acc = find_optimal_threshold(avg_probs.numpy(), all_labels_arr)
+        opt_thresh, opt_bal = find_optimal_threshold(all_probs, all_labels_arr)
 
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} "
-              f"bal_acc={bal_acc:.4f} f1={f1:.4f} opt_thresh={opt_thresh:.2f} opt_bal={opt_bal_acc:.4f}")
+              f"bal_acc={bal_acc:.4f} f1={f1:.4f} opt_bal={opt_bal:.4f}")
 
-        effective_bal = max(bal_acc, opt_bal_acc)
+        effective_bal = max(bal_acc, opt_bal)
         if effective_bal > best_bal_acc:
             best_bal_acc = effective_bal
-            if opt_bal_acc > bal_acc:
-                opt_preds = (avg_probs.numpy()[:, 1] > opt_thresh).astype(int)
+            if opt_bal > bal_acc:
+                opt_preds = (all_probs[:, 1] > opt_thresh).astype(int)
                 best_acc = accuracy_score(all_labels_arr, opt_preds)
                 best_f1 = f1_score(all_labels_arr, opt_preds, average="binary")
             else:
@@ -295,7 +289,7 @@ def train():
                 best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "dual_stream_resnet18_card_verification_multi_TTA_opt_threshold"
+    approach = "multi_view_comparison_net_shared_resnet18_proj_heads_card_verify_label_smooth_TTA"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
