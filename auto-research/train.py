@@ -1,8 +1,8 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: 3-stream ResNet18 shared encoder (far+near+card) + pairwise diffs + TTA + AMP
-Uses ALL 3 images. Pairwise embedding differences capture face-card inconsistencies.
-Optimized for speed: 160px images, 10 epochs, AMP throughout.
+Experiment: 9-channel ResNet18 (far+near+card concatenated) + cosine LR + TTA
+Uses ALL 3 images as a 9-channel input through a single modified ResNet18.
+Much faster than 3-stream since only one encoder pass.
 """
 import os, sys, json, time, random
 import numpy as np
@@ -22,14 +22,15 @@ from sklearn.model_selection import StratifiedKFold
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = DATA_DIR / "last_result.json"
 SEED = 42
-MAX_SECONDS = 220
-IMG_SIZE = 160
+MAX_SECONDS = 200
+IMG_SIZE = 224
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.benchmark = True
 
 
 def load_labels():
@@ -48,31 +49,56 @@ def load_labels():
     return labels
 
 
-class LivenessDataset3Stream(Dataset):
-    def __init__(self, sig_ids, labels, transform=None):
+class LivenessDataset9ch(Dataset):
+    def __init__(self, sig_ids, labels, train=False):
         self.sig_ids = sig_ids
         self.labels = labels
-        self.transform = transform
+        self.train = train
         self.samples_dir = DATA_DIR / "samples"
+        self.normalize = T.Normalize([0.485, 0.456, 0.406] * 3,
+                                      [0.229, 0.224, 0.225] * 3)
 
     def __len__(self):
         return len(self.sig_ids)
+
+    def _load_img(self, path):
+        try:
+            img = Image.open(str(path)).convert("RGB")
+        except Exception:
+            img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
+        return img
 
     def __getitem__(self, idx):
         sig = self.sig_ids[idx]
         info = self.labels[sig]
         label = 0 if info["main_label"] == "Positive" else 1
-        imgs = []
-        for name in ["far.jpg", "near.jpg", "card.jpg"]:
-            p = self.samples_dir / sig / name
-            try:
-                img = Image.open(str(p)).convert("RGB")
-            except Exception:
-                img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
-            if self.transform:
-                img = self.transform(img)
-            imgs.append(img)
-        return imgs[0], imgs[1], imgs[2], label
+        d = self.samples_dir / sig
+
+        far_img = self._load_img(d / "far.jpg")
+        near_img = self._load_img(d / "near.jpg")
+        card_img = self._load_img(d / "card.jpg")
+
+        if self.train:
+            tf = T.Compose([
+                T.Resize((IMG_SIZE + 32, IMG_SIZE + 32)),
+                T.RandomCrop(IMG_SIZE),
+                T.RandomHorizontalFlip(),
+                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+                T.ToTensor(),
+            ])
+        else:
+            tf = T.Compose([
+                T.Resize((IMG_SIZE, IMG_SIZE)),
+                T.ToTensor(),
+            ])
+
+        far_t = tf(far_img)
+        near_t = tf(near_img)
+        card_t = tf(card_img)
+
+        combined = torch.cat([far_t, near_t, card_t], dim=0)  # 9 channels
+        combined = self.normalize(combined)
+        return combined, label
 
 
 def load_data():
@@ -98,30 +124,21 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class ThreeStreamResNet(nn.Module):
-    def __init__(self, num_classes=2):
-        super().__init__()
-        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.encoder = nn.Sequential(*list(base.children())[:-1])
-        feat_dim = 512
-        self.classifier = nn.Sequential(
-            nn.BatchNorm1d(feat_dim * 6),
-            nn.Dropout(0.3),
-            nn.Linear(feat_dim * 6, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, far, near, card):
-        f_far = self.encoder(far).flatten(1)
-        f_near = self.encoder(near).flatten(1)
-        f_card = self.encoder(card).flatten(1)
-        diff_fn = torch.abs(f_far - f_near)
-        diff_fc = torch.abs(f_far - f_card)
-        diff_nc = torch.abs(f_near - f_card)
-        combined = torch.cat([f_far, f_near, f_card, diff_fn, diff_fc, diff_nc], dim=1)
-        return self.classifier(combined)
+def make_9ch_resnet18():
+    base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    old_conv = base.conv1
+    new_conv = nn.Conv2d(9, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    with torch.no_grad():
+        new_conv.weight[:, :3] = old_conv.weight
+        new_conv.weight[:, 3:6] = old_conv.weight
+        new_conv.weight[:, 6:9] = old_conv.weight
+    base.conv1 = new_conv
+    feat_dim = base.fc.in_features
+    base.fc = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(feat_dim, 2),
+    )
+    return base
 
 
 def train():
@@ -131,28 +148,14 @@ def train():
 
     train_ids, test_ids, labels = load_data()
 
-    transform_train = T.Compose([
-        T.Resize((IMG_SIZE + 16, IMG_SIZE + 16)),
-        T.RandomCrop(IMG_SIZE),
-        T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.15, contrast=0.15),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    transform_test = T.Compose([
-        T.Resize((IMG_SIZE, IMG_SIZE)),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+    train_ds = LivenessDataset9ch(train_ids, labels, train=True)
+    test_ds = LivenessDataset9ch(test_ids, labels, train=False)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    train_ds = LivenessDataset3Stream(train_ids, labels, transform_train)
-    test_ds = LivenessDataset3Stream(test_ids, labels, transform_test)
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=6, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=6, pin_memory=True)
-
-    model = ThreeStreamResNet().to(device)
+    model = make_9ch_resnet18().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: 3-stream ResNet18 shared encoder + pairwise diffs, params: {num_params:,}")
+    print(f"Model: 9ch ResNet18 (far+near+card concat), params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
@@ -160,10 +163,9 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = nn.CrossEntropyLoss(weight=weight.to(device))
 
-    epochs = 12
+    epochs = 15
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
     scaler = torch.amp.GradScaler('cuda')
 
     best_bal_acc = 0
@@ -173,16 +175,16 @@ def train():
     for epoch in range(epochs):
         elapsed_so_far = time.time() - t0
         if elapsed_so_far > MAX_SECONDS - 30:
-            print(f"Time budget approaching at epoch {epoch} ({elapsed_so_far:.0f}s)")
+            print(f"Time budget at epoch {epoch} ({elapsed_so_far:.0f}s)")
             break
 
         model.train()
         total_loss = 0
-        for far, near, card, targets in train_loader:
-            far, near, card, targets = far.to(device), near.to(device), card.to(device), targets.to(device)
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             with torch.amp.autocast('cuda'):
-                out = model(far, near, card)
+                out = model(inputs)
                 loss = criterion(out, targets)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -190,17 +192,16 @@ def train():
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
-
         scheduler.step()
 
         model.eval()
         all_preds, all_labels_list = [], []
         with torch.no_grad():
-            for far, near, card, targets in test_loader:
-                far, near, card = far.to(device), near.to(device), card.to(device)
+            for inputs, targets in test_loader:
+                inputs = inputs.to(device)
                 with torch.amp.autocast('cuda'):
-                    out1 = model(far, near, card)
-                    out2 = model(torch.flip(far, dims=[3]), torch.flip(near, dims=[3]), torch.flip(card, dims=[3]))
+                    out1 = model(inputs)
+                    out2 = model(torch.flip(inputs, dims=[3]))
                 out = (out1 + out2) / 2
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
@@ -219,7 +220,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "3stream_resnet18_shared_pairwise_diffs_160px_TTA_AMP"
+    approach = "9ch_resnet18_far_near_card_concat_224px_cosine_TTA_AMP"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
