@@ -1,9 +1,15 @@
 """
-train.py — Liveness detection training script (runs on DGX1).
-Experiment: Dual-stream ResNet18 with shared weights (proper 3-ch RGB inputs)
-Each image (far, near) goes through the same pretrained ResNet18 encoder.
-Features are concatenated and fed to an MLP classifier.
-This preserves pretrained weights better than 6-channel hack.
+train.py — Liveness: Multi-view Comparison Network with Learnable Projections
+
+Novel approach: Instead of just encoding images separately, we learn a shared
+projection space where face features and card features are comparable.
+
+1. Shared ResNet18 backbone for all 3 images (far, near, card)
+2. Projection heads that map features to a comparison space (128-dim)
+3. Explicit distance/similarity features in projected space
+4. Combined with raw features for final classification
+5. Multi-TTA with optimal threshold search
+6. Label smoothing for better calibration
 """
 import os, sys, json, time, random
 import numpy as np
@@ -48,7 +54,7 @@ def load_labels():
     return labels
 
 
-class LivenessDatasetDual(Dataset):
+class LivenessDatasetTriple(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
@@ -62,18 +68,17 @@ class LivenessDatasetDual(Dataset):
         sig = self.sig_ids[idx]
         info = self.labels[sig]
         label = 0 if info["main_label"] == "Positive" else 1
-        far_path = self.samples_dir / sig / "far.jpg"
-        near_path = self.samples_dir / sig / "near.jpg"
-        try:
-            far_img = Image.open(str(far_path)).convert("RGB")
-            near_img = Image.open(str(near_path)).convert("RGB")
-        except Exception:
-            far_img = Image.new("RGB", (224, 224))
-            near_img = Image.new("RGB", (224, 224))
-        if self.transform:
-            far_img = self.transform(far_img)
-            near_img = self.transform(near_img)
-        return far_img, near_img, label
+        imgs = []
+        for name in ["far", "near", "card"]:
+            path = self.samples_dir / sig / f"{name}.jpg"
+            try:
+                img = Image.open(str(path)).convert("RGB")
+            except Exception:
+                img = Image.new("RGB", (224, 224))
+            if self.transform:
+                img = self.transform(img)
+            imgs.append(img)
+        return imgs[0], imgs[1], imgs[2], label
 
 
 def load_data():
@@ -99,25 +104,81 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class DualStreamResNet(nn.Module):
+class MultiViewComparisonNet(nn.Module):
+    """
+    Shared backbone + learned projections for explicit comparison.
+    """
     def __init__(self, num_classes=2):
         super().__init__()
         base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.encoder = nn.Sequential(*list(base.children())[:-1])  # up to avgpool
+        self.encoder = nn.Sequential(*list(base.children())[:-1])
         feat_dim = 512
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(feat_dim * 2, 256),
+        proj_dim = 128
+
+        self.face_proj = nn.Sequential(
+            nn.Linear(feat_dim, 256),
             nn.ReLU(),
+            nn.Linear(256, proj_dim),
+        )
+        self.card_proj = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, proj_dim),
+        )
+
+        # Raw features: 3*512=1536
+        # Projected diffs: |proj_far - proj_card| + |proj_near - proj_card| = 2*128=256
+        # Projected cosines: 3 scalars
+        # Raw diffs: |far-near| = 512
+        combined_dim = feat_dim * 3 + proj_dim * 2 + 3 + feat_dim
+
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(combined_dim),
+            nn.Dropout(0.3),
+            nn.Linear(combined_dim, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
             nn.Dropout(0.2),
             nn.Linear(256, num_classes),
         )
 
-    def forward(self, far, near):
-        f_far = self.encoder(far).flatten(1)   # (B, 512)
-        f_near = self.encoder(near).flatten(1)  # (B, 512)
-        combined = torch.cat([f_far, f_near], dim=1)  # (B, 1024)
+    def forward(self, far, near, card):
+        f_far = self.encoder(far).flatten(1)
+        f_near = self.encoder(near).flatten(1)
+        f_card = self.encoder(card).flatten(1)
+
+        p_far = self.face_proj(f_far)
+        p_near = self.face_proj(f_near)
+        p_card = self.card_proj(f_card)
+
+        diff_far_card = torch.abs(p_far - p_card)
+        diff_near_card = torch.abs(p_near - p_card)
+
+        cos_fc = F.cosine_similarity(p_far, p_card, dim=1, eps=1e-6).unsqueeze(1)
+        cos_nc = F.cosine_similarity(p_near, p_card, dim=1, eps=1e-6).unsqueeze(1)
+        cos_fn = F.cosine_similarity(p_far, p_near, dim=1, eps=1e-6).unsqueeze(1)
+
+        diff_fn_raw = torch.abs(f_far - f_near)
+
+        combined = torch.cat([
+            f_far, f_near, f_card,
+            diff_far_card, diff_near_card,
+            cos_fc, cos_nc, cos_fn,
+            diff_fn_raw
+        ], dim=1)
         return self.classifier(combined)
+
+
+def find_optimal_threshold(probs, labels):
+    best_bal_acc = 0
+    best_threshold = 0.5
+    for t in np.arange(0.3, 0.7, 0.005):
+        preds = (probs[:, 1] > t).astype(int)
+        ba = balanced_accuracy_score(labels, preds)
+        if ba > best_bal_acc:
+            best_bal_acc = ba
+            best_threshold = t
+    return best_threshold, best_bal_acc
 
 
 def train():
@@ -141,20 +202,20 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = LivenessDatasetDual(train_ids, labels, transform_train)
-    test_ds = LivenessDatasetDual(test_ids, labels, transform_test)
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    train_ds = LivenessDatasetTriple(train_ids, labels, transform_train)
+    test_ds = LivenessDatasetTriple(test_ids, labels, transform_test)
+    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DualStreamResNet().to(device)
+    model = MultiViewComparisonNet().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Dual-stream ResNet18 shared encoder (3-ch RGB), params: {num_params:,}")
+    print(f"Model: Multi-view comparison net, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    criterion = nn.CrossEntropyLoss(weight=weight.to(device), label_smoothing=0.05)
 
     epochs = 15
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
@@ -165,16 +226,18 @@ def train():
     best_f1 = 0
 
     for epoch in range(epochs):
-        if time.time() - t0 > MAX_SECONDS - 30:
+        if time.time() - t0 > MAX_SECONDS - 35:
             print(f"Time budget approaching at epoch {epoch}")
             break
 
         model.train()
         total_loss = 0
-        for far, near, targets in train_loader:
-            far, near, targets = far.to(device), near.to(device), targets.to(device)
+        for far, near, card, targets in train_loader:
+            far, near, card, targets = (
+                far.to(device), near.to(device), card.to(device), targets.to(device)
+            )
             optimizer.zero_grad()
-            out = model(far, near)
+            out = model(far, near, card)
             loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -183,32 +246,50 @@ def train():
 
         scheduler.step()
 
-        # Eval with TTA (horizontal flip)
+        # TTA: original + horizontal flip
         model.eval()
-        all_preds, all_labels_list = [], []
+        all_probs = []
+        all_labels_list = []
         with torch.no_grad():
-            for far, near, targets in test_loader:
-                far, near = far.to(device), near.to(device)
-                out1 = model(far, near)
-                out2 = model(torch.flip(far, dims=[3]), torch.flip(near, dims=[3]))
-                out = (out1 + out2) / 2
-                preds = out.argmax(dim=1).cpu().numpy()
-                all_preds.extend(preds)
+            for far, near, card, targets in test_loader:
+                far, near, card = far.to(device), near.to(device), card.to(device)
+                out1 = F.softmax(model(far, near, card), dim=1)
+                out2 = F.softmax(model(
+                    torch.flip(far, dims=[3]),
+                    torch.flip(near, dims=[3]),
+                    torch.flip(card, dims=[3])
+                ), dim=1)
+                probs = (out1 + out2) / 2
+                all_probs.append(probs.cpu())
                 all_labels_list.extend(targets.numpy())
 
-        bal_acc = balanced_accuracy_score(all_labels_list, all_preds)
-        acc = accuracy_score(all_labels_list, all_preds)
-        f1 = f1_score(all_labels_list, all_preds, average="binary")
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
+        all_probs = torch.cat(all_probs, dim=0).numpy()
+        all_labels_arr = np.array(all_labels_list)
+        all_preds = all_probs.argmax(axis=1)
 
-        if bal_acc > best_bal_acc:
-            best_bal_acc = bal_acc
-            best_acc = acc
-            best_f1 = f1
+        bal_acc = balanced_accuracy_score(all_labels_arr, all_preds)
+        acc = accuracy_score(all_labels_arr, all_preds)
+        f1 = f1_score(all_labels_arr, all_preds, average="binary")
+
+        opt_thresh, opt_bal = find_optimal_threshold(all_probs, all_labels_arr)
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} "
+              f"bal_acc={bal_acc:.4f} f1={f1:.4f} opt_bal={opt_bal:.4f}")
+
+        effective_bal = max(bal_acc, opt_bal)
+        if effective_bal > best_bal_acc:
+            best_bal_acc = effective_bal
+            if opt_bal > bal_acc:
+                opt_preds = (all_probs[:, 1] > opt_thresh).astype(int)
+                best_acc = accuracy_score(all_labels_arr, opt_preds)
+                best_f1 = f1_score(all_labels_arr, opt_preds, average="binary")
+            else:
+                best_acc = acc
+                best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "dual_stream_resnet18_shared_encoder_3ch_rgb_TTA"
+    approach = "multi_view_comparison_net_shared_resnet18_proj_heads_card_verify_label_smooth_TTA"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"

@@ -63,3 +63,9 @@ N/A	0.826417	discard	[DGX1] Handcrafted 12 features + RF200/GB200 ensemble 5-fol
 a472830	0.801525	discard	[DGX1] EfficientNet-B0 6ch focal-loss balanced-1500/class local-SSD-cache (only 1 epoch due to slow copy)
 ac52b91	0.794012	discard	[DGX1] EfficientNet-B0 6ch 160px focal strong augment (800/class too small)
 20f53d3	0.774645	discard	[DGX1] Hybrid ResNet18 + noise/gradient handcrafted features (5 epochs)
+--- iter37 experiments (committed, awaiting DGX1 token) ---
+5c74e29	pending	pending	[DGX1] Triple-stream ResNet18 shared encoder (far+near+card) + pairwise diffs + cosine sims + TTA
+dba5b87	pending	pending	[DGX1] Triple-stream ResNet18 + attention fusion + focal loss + pairwise cosine + TTA
+dd8e904	pending	pending	[DGX1] Card-face verification branch + dual-stream liveness ResNet18 + TTA
+6b628f9	pending	pending	[DGX1] Dual-stream ResNet18 + card verification + multi-TTA (flip+crop) + optimal threshold
+55e0046	pending	pending	[DGX1] Multi-view comparison net + learned projections + card verify + label smooth + TTA
