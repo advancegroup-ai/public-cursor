@@ -63,3 +63,4 @@ N/A	0.826417	discard	[DGX1] Handcrafted 12 features + RF200/GB200 ensemble 5-fol
 a472830	0.801525	discard	[DGX1] EfficientNet-B0 6ch focal-loss balanced-1500/class local-SSD-cache (only 1 epoch due to slow copy)
 ac52b91	0.794012	discard	[DGX1] EfficientNet-B0 6ch 160px focal strong augment (800/class too small)
 20f53d3	0.774645	discard	[DGX1] Hybrid ResNet18 + noise/gradient handcrafted features (5 epochs)
+b68dd12	N/A	pending	[DGX1] Triple-stream ResNet18 shared encoder (far+near+card) + cross-stream diff features + TTA (no token - not run)
