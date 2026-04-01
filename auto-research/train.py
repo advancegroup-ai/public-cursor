@@ -1,9 +1,10 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: Dual-stream ResNet18 with shared weights (proper 3-ch RGB inputs)
-Each image (far, near) goes through the same pretrained ResNet18 encoder.
-Features are concatenated and fed to an MLP classifier.
-This preserves pretrained weights better than 6-channel hack.
+Experiment: 3-stream ResNet18 shared encoder (far + near + card) with cross-stream
+difference features + TTA. The card image provides the reference face on the ID document.
+Attacks (especially deepfake injection) show mismatches between card face and far/near face.
+By including the card stream AND explicit difference features (far-card, near-card),
+the model can learn to detect these inconsistencies directly.
 """
 import os, sys, json, time, random
 import numpy as np
@@ -48,7 +49,7 @@ def load_labels():
     return labels
 
 
-class LivenessDatasetDual(Dataset):
+class LivenessDataset3Stream(Dataset):
     def __init__(self, sig_ids, labels, transform=None):
         self.sig_ids = sig_ids
         self.labels = labels
@@ -64,16 +65,24 @@ class LivenessDatasetDual(Dataset):
         label = 0 if info["main_label"] == "Positive" else 1
         far_path = self.samples_dir / sig / "far.jpg"
         near_path = self.samples_dir / sig / "near.jpg"
+        card_path = self.samples_dir / sig / "card.jpg"
         try:
             far_img = Image.open(str(far_path)).convert("RGB")
-            near_img = Image.open(str(near_path)).convert("RGB")
         except Exception:
             far_img = Image.new("RGB", (224, 224))
+        try:
+            near_img = Image.open(str(near_path)).convert("RGB")
+        except Exception:
             near_img = Image.new("RGB", (224, 224))
+        try:
+            card_img = Image.open(str(card_path)).convert("RGB")
+        except Exception:
+            card_img = Image.new("RGB", (224, 224))
         if self.transform:
             far_img = self.transform(far_img)
             near_img = self.transform(near_img)
-        return far_img, near_img, label
+            card_img = self.transform(card_img)
+        return far_img, near_img, card_img, label
 
 
 def load_data():
@@ -99,24 +108,43 @@ def load_data():
     return train_ids, test_ids, labels
 
 
-class DualStreamResNet(nn.Module):
+class ThreeStreamResNet(nn.Module):
+    """
+    3-stream ResNet18 with shared encoder for far, near, and card images.
+    Computes pairwise difference features (far-card, near-card, far-near)
+    to explicitly model cross-stream inconsistencies.
+    """
     def __init__(self, num_classes=2):
         super().__init__()
         base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.encoder = nn.Sequential(*list(base.children())[:-1])  # up to avgpool
+        self.encoder = nn.Sequential(*list(base.children())[:-1])
         feat_dim = 512
+        # 3 streams (1536) + 3 difference vectors (1536) = 3072
+        combined_dim = feat_dim * 3 + feat_dim * 3
         self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(feat_dim * 2, 256),
+            nn.BatchNorm1d(combined_dim),
+            nn.Dropout(0.4),
+            nn.Linear(combined_dim, 512),
             nn.ReLU(),
+            nn.BatchNorm1d(512),
             nn.Dropout(0.2),
-            nn.Linear(256, num_classes),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes),
         )
 
-    def forward(self, far, near):
-        f_far = self.encoder(far).flatten(1)   # (B, 512)
-        f_near = self.encoder(near).flatten(1)  # (B, 512)
-        combined = torch.cat([f_far, f_near], dim=1)  # (B, 1024)
+    def forward(self, far, near, card):
+        f_far = self.encoder(far).flatten(1)
+        f_near = self.encoder(near).flatten(1)
+        f_card = self.encoder(card).flatten(1)
+        # Pairwise absolute differences to capture inconsistencies
+        diff_far_card = torch.abs(f_far - f_card)
+        diff_near_card = torch.abs(f_near - f_card)
+        diff_far_near = torch.abs(f_far - f_near)
+        combined = torch.cat([
+            f_far, f_near, f_card,
+            diff_far_card, diff_near_card, diff_far_near
+        ], dim=1)
         return self.classifier(combined)
 
 
@@ -141,14 +169,14 @@ def train():
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    train_ds = LivenessDatasetDual(train_ids, labels, transform_train)
-    test_ds = LivenessDatasetDual(test_ids, labels, transform_test)
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    train_ds = LivenessDataset3Stream(train_ids, labels, transform_train)
+    test_ds = LivenessDataset3Stream(test_ids, labels, transform_test)
+    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DualStreamResNet().to(device)
+    model = ThreeStreamResNet().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: Dual-stream ResNet18 shared encoder (3-ch RGB), params: {num_params:,}")
+    print(f"Model: 3-stream ResNet18 shared encoder + diff features, params: {num_params:,}")
 
     train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels)
@@ -171,10 +199,10 @@ def train():
 
         model.train()
         total_loss = 0
-        for far, near, targets in train_loader:
-            far, near, targets = far.to(device), near.to(device), targets.to(device)
+        for far, near, card, targets in train_loader:
+            far, near, card, targets = far.to(device), near.to(device), card.to(device), targets.to(device)
             optimizer.zero_grad()
-            out = model(far, near)
+            out = model(far, near, card)
             loss = criterion(out, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -183,14 +211,17 @@ def train():
 
         scheduler.step()
 
-        # Eval with TTA (horizontal flip)
         model.eval()
         all_preds, all_labels_list = [], []
         with torch.no_grad():
-            for far, near, targets in test_loader:
-                far, near = far.to(device), near.to(device)
-                out1 = model(far, near)
-                out2 = model(torch.flip(far, dims=[3]), torch.flip(near, dims=[3]))
+            for far, near, card, targets in test_loader:
+                far, near, card = far.to(device), near.to(device), card.to(device)
+                out1 = model(far, near, card)
+                out2 = model(
+                    torch.flip(far, dims=[3]),
+                    torch.flip(near, dims=[3]),
+                    torch.flip(card, dims=[3])
+                )
                 out = (out1 + out2) / 2
                 preds = out.argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
@@ -208,7 +239,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "dual_stream_resnet18_shared_encoder_3ch_rgb_TTA"
+    approach = "3stream_resnet18_shared_far_near_card_diff_features_TTA"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
