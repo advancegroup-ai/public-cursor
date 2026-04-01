@@ -1,9 +1,9 @@
 """
-train.py — Liveness detection: 3-stream ResNet18 (far, near, card) with separate encoders
-Key idea: Separate encoders for each image stream to learn stream-specific features,
-then fuse via concatenation + MLP classifier.
-Card stream can learn ID document specific features.
-AMP, 160px, 8 epochs for speed.
+train.py — Liveness detection: Dual-stream shared encoder (far+near) + card verification branch
+Key idea: Keep the best dual-stream approach (shared ResNet18 for far+near)
+AND add a card verification branch that compares face embeddings with the card face.
+The card branch provides a consistency signal - is the face on the card matching the person?
+AMP, 160px, 8 epochs.
 """
 import os, sys, json, time, random, math
 import numpy as np
@@ -102,33 +102,50 @@ class FocalLoss(nn.Module):
         return ((1 - pt) ** self.gamma * ce).mean()
 
 
-class ThreeStreamModel(nn.Module):
-    """Three separate ResNet18 encoders (far, near, card) → concat → classifier."""
+class DualStreamWithCardVerification(nn.Module):
+    """Shared ResNet18 for all 3 streams + card-face consistency features → classifier."""
     def __init__(self, num_classes=2):
         super().__init__()
-        self.far_encoder = self._make_encoder()
-        self.near_encoder = self._make_encoder()
-        self.card_encoder = self._make_encoder()
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.encoder = nn.Sequential(*list(base.children())[:-1])
+        feat_dim = 512
 
-        feat_dim = 512 * 3
+        # Face-card consistency: element-wise differences + cosine similarity features
+        # far_feat, near_feat, card_feat: 512 each
+        # consistency features: |far-card|, |near-card|, cosine(far,card), cosine(near,card)
+        # Total: 512*3 + 512*2 + 2 = 2562 (but we'll project diffs)
+        self.diff_proj = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+        )
+
+        # 512*3 (raw features) + 128*2 (projected diffs) + 2 (cosine sims)
+        fused_dim = feat_dim * 3 + 128 * 2 + 2
         self.classifier = nn.Sequential(
-            nn.BatchNorm1d(feat_dim),
+            nn.BatchNorm1d(fused_dim),
             nn.Dropout(0.4),
-            nn.Linear(feat_dim, 256),
+            nn.Linear(fused_dim, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(256, num_classes),
         )
 
-    def _make_encoder(self):
-        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        return nn.Sequential(*list(base.children())[:-1])
-
     def forward(self, far, near, card):
-        f_far = self.far_encoder(far).flatten(1)
-        f_near = self.near_encoder(near).flatten(1)
-        f_card = self.card_encoder(card).flatten(1)
-        combined = torch.cat([f_far, f_near, f_card], dim=1)
+        f_far = self.encoder(far).flatten(1)
+        f_near = self.encoder(near).flatten(1)
+        f_card = self.encoder(card).flatten(1)
+
+        diff_far_card = self.diff_proj(torch.abs(f_far - f_card))
+        diff_near_card = self.diff_proj(torch.abs(f_near - f_card))
+
+        cos_far_card = F.cosine_similarity(f_far, f_card, dim=1, eps=1e-6).unsqueeze(1)
+        cos_near_card = F.cosine_similarity(f_near, f_card, dim=1, eps=1e-6).unsqueeze(1)
+
+        combined = torch.cat([
+            f_far, f_near, f_card,
+            diff_far_card, diff_near_card,
+            cos_far_card, cos_near_card,
+        ], dim=1)
         return self.classifier(combined)
 
 
@@ -158,9 +175,9 @@ def train():
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = ThreeStreamModel().to(device)
+    model = DualStreamWithCardVerification().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: 3-stream ResNet18 (far+near+card), params: {num_params:,}")
+    print(f"Model: Shared ResNet18 + card verification, params: {num_params:,}")
 
     train_labels_list = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
     class_counts = Counter(train_labels_list)
@@ -228,7 +245,7 @@ def train():
             best_f1 = f1v
 
     elapsed = time.time() - t0
-    approach = "3stream_resnet18_far_near_card_separate_encoders_AMP_focal_TTA"
+    approach = "shared_resnet18_3img_card_verification_cosine_diff_AMP_focal_TTA"
 
     result_block = (
         f"\n---\n"
