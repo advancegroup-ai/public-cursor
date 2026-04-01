@@ -1,8 +1,8 @@
 """
-train.py — Liveness detection training script (runs on DGX1).
-Experiment: 9-channel ResNet18 (far+near+card concatenated) + cosine LR + TTA
-Uses ALL 3 images as a 9-channel input through a single modified ResNet18.
-Much faster than 3-stream since only one encoder pass.
+train.py — Liveness detection: Pre-cached 9ch ResNet18 (far+near+card)
+KEY FIX: Pre-loads ALL images into RAM before training to avoid NAS I/O bottleneck.
+Previous attempts with DataLoader-based NAS reads timed out before completing 1 epoch.
+Architecture: 9ch ResNet18 + focal loss + cosine LR + TTA + AMP.
 """
 import os, sys, json, time, random
 import numpy as np
@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
@@ -22,8 +23,8 @@ from sklearn.model_selection import StratifiedKFold
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = DATA_DIR / "last_result.json"
 SEED = 42
-MAX_SECONDS = 200
-IMG_SIZE = 224
+MAX_SECONDS = 250
+IMG_SIZE = 160
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -32,11 +33,28 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
     torch.backends.cudnn.benchmark = True
 
+print(f"Starting at {time.strftime('%H:%M:%S')}")
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
+
 
 def load_labels():
     labels = {}
     for fname in ["neg_batch.json", "pos_batch.json"]:
-        with open(str(DATA_DIR / fname)) as f:
+        fpath = DATA_DIR / fname
+        if not fpath.exists():
+            continue
+        with open(str(fpath)) as f:
             batch = json.load(f)
         for d in batch.get("data", []):
             parts = d["sample_id"].split("_")
@@ -46,82 +64,71 @@ def load_labels():
                 if main_label in ("Negative Type", "Negative_Type"):
                     main_label = "Negative"
                 labels[sig] = {"main_label": main_label, "pn": d["pn"]}
+    if not labels:
+        with open(str(DATA_DIR / "labels.json")) as f:
+            labels = json.load(f)
     return labels
 
 
-class LivenessDataset9ch(Dataset):
-    def __init__(self, sig_ids, labels, train=False):
-        self.sig_ids = sig_ids
+class PreCachedDataset(Dataset):
+    """In-memory dataset - all tensors pre-loaded to avoid NAS I/O during training."""
+    def __init__(self, tensors, labels, augment=False):
+        self.tensors = tensors
         self.labels = labels
-        self.train = train
-        self.samples_dir = DATA_DIR / "samples"
-        self.normalize = T.Normalize([0.485, 0.456, 0.406] * 3,
-                                      [0.229, 0.224, 0.225] * 3)
+        self.augment = augment
 
     def __len__(self):
-        return len(self.sig_ids)
-
-    def _load_img(self, path):
-        try:
-            img = Image.open(str(path)).convert("RGB")
-        except Exception:
-            img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
-        return img
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        sig = self.sig_ids[idx]
-        info = self.labels[sig]
-        label = 0 if info["main_label"] == "Positive" else 1
-        d = self.samples_dir / sig
-
-        far_img = self._load_img(d / "far.jpg")
-        near_img = self._load_img(d / "near.jpg")
-        card_img = self._load_img(d / "card.jpg")
-
-        if self.train:
-            tf = T.Compose([
-                T.Resize((IMG_SIZE + 32, IMG_SIZE + 32)),
-                T.RandomCrop(IMG_SIZE),
-                T.RandomHorizontalFlip(),
-                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-                T.ToTensor(),
-            ])
-        else:
-            tf = T.Compose([
-                T.Resize((IMG_SIZE, IMG_SIZE)),
-                T.ToTensor(),
-            ])
-
-        far_t = tf(far_img)
-        near_t = tf(near_img)
-        card_t = tf(card_img)
-
-        combined = torch.cat([far_t, near_t, card_t], dim=0)  # 9 channels
-        combined = self.normalize(combined)
-        return combined, label
+        x = self.tensors[idx]
+        if self.augment:
+            if random.random() > 0.5:
+                x = torch.flip(x, dims=[2])
+            if random.random() > 0.5:
+                brightness = 0.8 + random.random() * 0.4
+                x = x * brightness
+        return x, self.labels[idx]
 
 
-def load_data():
-    labels = load_labels()
+def precache_all_images(sig_ids, labels):
+    """Load all images into RAM at once to avoid NAS I/O during training."""
     samples_dir = DATA_DIR / "samples"
-    all_sigs = set(os.listdir(str(samples_dir)))
-    valid_sigs = [s for s in labels if s in all_sigs
-                  and (samples_dir / s / "far.jpg").exists()
-                  and (samples_dir / s / "near.jpg").exists()]
-    binary_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in valid_sigs]
-    print(f"Total valid samples: {len(valid_sigs)}")
-    print(f"Distribution: {Counter(binary_labels)}")
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(valid_sigs, binary_labels)):
-        if fold_idx == 0:
-            train_ids = [valid_sigs[i] for i in train_idx]
-            test_ids = [valid_sigs[i] for i in test_idx]
-            break
-    dist_train = Counter(labels[s]["main_label"] for s in train_ids)
-    dist_test = Counter(labels[s]["main_label"] for s in test_ids)
-    print(f"Train: {len(train_ids)} {dict(dist_train)}")
-    print(f"Test:  {len(test_ids)} {dict(dist_test)}")
-    return train_ids, test_ids, labels
+    resize = T.Resize((IMG_SIZE, IMG_SIZE))
+    to_tensor = T.ToTensor()
+    
+    all_tensors = []
+    all_labels = []
+    
+    t0 = time.time()
+    for i, sig in enumerate(sig_ids):
+        imgs = []
+        for name in ["far.jpg", "near.jpg", "card.jpg"]:
+            path = samples_dir / sig / name
+            try:
+                img = Image.open(str(path)).convert("RGB")
+                img = resize(img)
+                t = to_tensor(img)
+            except Exception:
+                t = torch.zeros(3, IMG_SIZE, IMG_SIZE)
+            imgs.append(t)
+        
+        combined = torch.cat(imgs, dim=0)  # 9 channels
+        # Normalize each 3-channel group
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        for ch_start in [0, 3, 6]:
+            combined[ch_start:ch_start+3] = (combined[ch_start:ch_start+3] - mean) / std
+        
+        all_tensors.append(combined)
+        label = 0 if labels[sig]["main_label"] == "Positive" else 1
+        all_labels.append(label)
+        
+        if (i + 1) % 500 == 0:
+            print(f"  Pre-cached {i+1}/{len(sig_ids)} in {time.time()-t0:.1f}s")
+    
+    print(f"  Pre-cached all {len(sig_ids)} in {time.time()-t0:.1f}s")
+    return torch.stack(all_tensors), torch.tensor(all_labels, dtype=torch.long)
 
 
 def make_9ch_resnet18():
@@ -146,25 +153,49 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    train_ids, test_ids, labels = load_data()
+    labels = load_labels()
+    samples_dir = DATA_DIR / "samples"
+    all_sigs = set(os.listdir(str(samples_dir)))
+    valid_sigs = [s for s in labels if s in all_sigs
+                  and (samples_dir / s / "far.jpg").exists()
+                  and (samples_dir / s / "near.jpg").exists()]
+    binary_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in valid_sigs]
+    print(f"Total valid samples: {len(valid_sigs)}, distribution: {Counter(binary_labels)}")
 
-    train_ds = LivenessDataset9ch(train_ids, labels, train=True)
-    test_ds = LivenessDataset9ch(test_ids, labels, train=False)
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(valid_sigs, binary_labels)):
+        if fold_idx == 0:
+            train_ids = [valid_sigs[i] for i in train_idx]
+            test_ids = [valid_sigs[i] for i in test_idx]
+            break
+
+    print(f"Train: {len(train_ids)}, Test: {len(test_ids)}")
+    
+    # Pre-cache ALL images into RAM
+    print("Pre-caching training images...")
+    X_train, y_train = precache_all_images(train_ids, labels)
+    print("Pre-caching test images...")
+    X_test, y_test = precache_all_images(test_ids, labels)
+    
+    load_time = time.time() - t0
+    print(f"Data loading: {load_time:.1f}s")
+
+    train_ds = PreCachedDataset(X_train, y_train, augment=True)
+    test_ds = PreCachedDataset(X_test, y_test, augment=False)
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0, pin_memory=True)
 
     model = make_9ch_resnet18().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: 9ch ResNet18 (far+near+card concat), params: {num_params:,}")
+    print(f"Model: 9ch ResNet18, params: {num_params:,}")
 
-    train_labels = [0 if labels[s]["main_label"] == "Positive" else 1 for s in train_ids]
-    class_counts = Counter(train_labels)
+    class_counts = Counter(y_train.numpy().tolist())
     weight = torch.tensor([1.0 / class_counts[0], 1.0 / class_counts[1]], dtype=torch.float32)
     weight = weight / weight.sum() * 2
-    criterion = nn.CrossEntropyLoss(weight=weight.to(device))
+    criterion = FocalLoss(alpha=weight.to(device), gamma=2.0)
 
-    epochs = 15
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    epochs = 20
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = torch.amp.GradScaler('cuda')
 
@@ -173,9 +204,9 @@ def train():
     best_f1 = 0
 
     for epoch in range(epochs):
-        elapsed_so_far = time.time() - t0
-        if elapsed_so_far > MAX_SECONDS - 30:
-            print(f"Time budget at epoch {epoch} ({elapsed_so_far:.0f}s)")
+        remaining = MAX_SECONDS - (time.time() - t0)
+        if remaining < 15:
+            print(f"Time budget at epoch {epoch} ({time.time()-t0:.0f}s)")
             break
 
         model.train()
@@ -194,6 +225,7 @@ def train():
             total_loss += loss.item()
         scheduler.step()
 
+        # Eval with TTA (original + horizontal flip)
         model.eval()
         all_preds, all_labels_list = [], []
         with torch.no_grad():
@@ -211,8 +243,7 @@ def train():
         acc = accuracy_score(all_labels_list, all_preds)
         f1 = f1_score(all_labels_list, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
-        elapsed = time.time() - t0
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} t={elapsed:.0f}s")
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} [{time.time()-t0:.0f}s]")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
@@ -220,7 +251,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "9ch_resnet18_far_near_card_concat_224px_cosine_TTA_AMP"
+    approach = "9ch_resnet18_precached_160px_focal_cosine_TTA_AMP_20ep"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
