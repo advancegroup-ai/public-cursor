@@ -22,7 +22,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+import re
+import subprocess
+
 import requests
+
+REPO_DIR = Path("/tmp/public-cursor")
+GIT_SSH_CMD = "ssh -i ~/.ssh/id_ed25519_github -o StrictHostKeyChecking=no"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -156,6 +162,176 @@ def save_state(state: dict):
         json.dump(state, f, indent=2, default=str)
 
 # ---------------------------------------------------------------------------
+# Git operations: consolidate results across branches
+# ---------------------------------------------------------------------------
+
+def _git(args: list, cwd=None) -> str:
+    """Run a git command and return stdout."""
+    env = os.environ.copy()
+    env["GIT_SSH_COMMAND"] = GIT_SSH_CMD
+    result = subprocess.run(
+        ["/usr/bin/git"] + args,
+        capture_output=True, text=True, timeout=60,
+        cwd=cwd or REPO_DIR, env=env,
+    )
+    return result.stdout.strip()
+
+
+def _parse_results_tsv(content: str) -> list:
+    """Parse results.tsv into list of (bal_acc, full_line) tuples."""
+    entries = []
+    for line in content.strip().split("\n"):
+        line = line.strip()
+        if not line or line.startswith("commit") or line.startswith("---"):
+            continue
+        parts = line.split("\t")
+        try:
+            bal_acc = float(parts[1])
+            entries.append((bal_acc, line))
+        except (IndexError, ValueError):
+            if "blocked" not in line.lower() and "N/A" not in line:
+                entries.append((0.0, line))
+    return entries
+
+
+def consolidate_results():
+    """Merge all branch results.tsv entries into main and push."""
+    print("  [consolidate] Fetching branches...")
+    _git(["fetch", "--all", "--prune"])
+    _git(["checkout", "main"])
+    _git(["pull", "origin", "main"])
+
+    main_tsv = _git(["show", "HEAD:auto-research/results.tsv"])
+    main_entries = _parse_results_tsv(main_tsv)
+    main_descs = {e[1].split("\t")[-1].strip() for e in main_entries}
+
+    branches = _git(["branch", "-r"]).split("\n")
+    auto_branches = [b.strip().replace("origin/", "")
+                     for b in branches if "autoresearch/liveness-v2" in b]
+
+    new_entries = []
+    for branch in auto_branches:
+        try:
+            branch_tsv = _git(["show", f"origin/{branch}:auto-research/results.tsv"])
+        except Exception:
+            continue
+        for bal_acc, line in _parse_results_tsv(branch_tsv):
+            desc = line.split("\t")[-1].strip()
+            if desc not in main_descs and bal_acc > 0:
+                new_entries.append((bal_acc, line))
+                main_descs.add(desc)
+
+    if not new_entries:
+        print("  [consolidate] No new results to merge")
+        return
+
+    new_entries.sort(key=lambda x: -x[0])
+    print(f"  [consolidate] Merging {len(new_entries)} new results into main")
+
+    results_path = REPO_DIR / "auto-research" / "results.tsv"
+    current = results_path.read_text()
+    additions = "\n".join(line for _, line in new_entries)
+    results_path.write_text(current.rstrip() + "\n" + additions + "\n")
+
+    _git(["add", "auto-research/results.tsv"])
+    msg_file = Path("/tmp/_consolidate_msg.txt")
+    msg_file.write_text(f"consolidate: merge {len(new_entries)} results from branches")
+    _git(["commit", "-F", str(msg_file)])
+    _git(["push", "origin", "main"])
+    print(f"  [consolidate] Pushed {len(new_entries)} new results to main")
+
+
+def merge_best_train():
+    """Copy the best-performing train.py from branches to main.
+
+    Only considers [DGX1] results (real GPU experiments on full dataset),
+    ignoring early synthetic/CPU experiments that had inflated scores.
+    """
+    _git(["checkout", "main"])
+
+    branches = _git(["branch", "-r"]).split("\n")
+    auto_branches = [b.strip().replace("origin/", "")
+                     for b in branches if "autoresearch/liveness-v2" in b]
+
+    best_acc = 0.0
+    best_branch = None
+    for branch in auto_branches:
+        try:
+            branch_tsv = _git(["show", f"origin/{branch}:auto-research/results.tsv"])
+        except Exception:
+            continue
+        for bal_acc, line in _parse_results_tsv(branch_tsv):
+            if bal_acc > best_acc and "[DGX1]" in line:
+                best_acc = bal_acc
+                best_branch = branch
+
+    if not best_branch or best_acc <= 0:
+        print("  [merge-train] No branch with DGX1 results found")
+        return
+
+    try:
+        best_train = _git(["show", f"origin/{best_branch}:auto-research/train.py"])
+    except Exception:
+        print(f"  [merge-train] Could not read train.py from {best_branch}")
+        return
+
+    train_path = REPO_DIR / "auto-research" / "train.py"
+    current_train = train_path.read_text()
+    if best_train == current_train:
+        print(f"  [merge-train] train.py already up to date (best DGX1: {best_acc:.4f} from {best_branch})")
+        return
+
+    train_path.write_text(best_train)
+    _git(["add", "auto-research/train.py"])
+    msg_file = Path("/tmp/_merge_train_msg.txt")
+    msg_file.write_text(f"merge best train.py from {best_branch} (DGX1 bal_acc={best_acc:.4f})")
+    try:
+        _git(["commit", "-F", str(msg_file)])
+        _git(["push", "origin", "main"])
+        print(f"  [merge-train] Merged train.py from {best_branch} (DGX1 bal_acc={best_acc:.4f})")
+    except Exception:
+        print(f"  [merge-train] Nothing to commit (train.py unchanged)")
+
+
+def get_top_results(n: int = 10) -> list:
+    """Parse results.tsv from disk and return top-N results.
+
+    Prioritizes [DGX1] results but includes others too so the agent
+    sees the full picture.
+    """
+    results_path = REPO_DIR / "auto-research" / "results.tsv"
+    if not results_path.exists():
+        _git(["checkout", "main"])
+        _git(["pull", "origin", "main"])
+    if not results_path.exists():
+        return []
+    content = results_path.read_text()
+    dgx1_entries = []
+    other_entries = []
+    seen_descs = set()
+    for bal_acc, line in _parse_results_tsv(content):
+        if bal_acc > 0.5:
+            parts = line.split("\t")
+            desc = parts[-1].strip() if len(parts) >= 3 else line
+            # Deduplicate by (rounded accuracy + simplified description)
+            dedup_key = f"{bal_acc:.4f}_{desc[:50]}"
+            if dedup_key in seen_descs:
+                continue
+            seen_descs.add(dedup_key)
+            if "[DGX1]" in desc:
+                dgx1_entries.append((bal_acc, desc))
+            else:
+                other_entries.append((bal_acc, desc))
+    dgx1_entries.sort(key=lambda x: -x[0])
+    other_entries.sort(key=lambda x: -x[0])
+    combined = dgx1_entries[:n]
+    remaining = n - len(combined)
+    if remaining > 0:
+        combined.extend(other_entries[:remaining])
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # Prompt building
 # ---------------------------------------------------------------------------
 
@@ -167,11 +343,23 @@ You are continuing an ongoing autonomous research project. This is session {iter
 
 {context}
 
+## STEP 0: Preflight Check (MANDATORY)
+
+Before anything else, run this connectivity test:
+```bash
+cd auto-research
+export VT_TOKEN="<token from API Authentication section below>"
+export VT_REFRESH_TOKEN="<refresh token from API Authentication section below>"
+python3 run_remote.py --code "import torch; print(f'DGX1_OK gpus={{torch.cuda.device_count()}}')" --timeout 30
+```
+- If it prints `DGX1_OK` → proceed to experiments.
+- If it fails → set env vars, retry ONCE. If still failing → commit your train.py ideas and STOP. Do NOT debug infrastructure.
+
 ## Your task
 
 1. Read `auto-research/program.md` — it has FULL architecture details
 2. Check `auto-research/results.tsv` for previous experiment results
-3. Read `auto-research/train.py` to see the current approach
+3. Read `auto-research/train.py` to see the current best approach
 4. Modify `auto-research/train.py` with a NEW experimental idea
 5. Commit: `git add auto-research/train.py && git commit -m "experiment: description"`
 6. Execute on DGX1: `cd auto-research && python3 run_remote.py --script train.py --timeout 300`
@@ -187,7 +375,7 @@ You are continuing an ongoing autonomous research project. This is session {iter
 - `run_remote.py` sends `train.py` to DGX1 via API and returns stdout
 - DGX1 has: PyTorch 2.4, CUDA 12.1, torchvision, sklearn, PIL
 - Data on NAS: `/mnt/nas/public2/simon/projects/auto_research/liveness-research/data/`
-- 2,586 human-annotated samples: face far shot + face near shot + optional ID card
+- ~3,600 human-annotated samples with 3 images each: face far shot + face near shot + ID card
 - Binary: Positive (live, label=0) vs Negative (attack/deepfake, label=1)
 
 ## CRITICAL RULES
@@ -231,12 +419,12 @@ def send_email_report(subject: str, html: str):
 
 
 def build_iteration_report(iteration: int, entry: dict, state: dict, conversation: list) -> str:
-    """Build HTML email for a completed iteration."""
+    """Build HTML email for a completed iteration with leaderboard."""
     agent_id = entry.get("agent_id", "?")
     status = entry.get("final_status", "?")
     experiments = entry.get("experiments", 0)
     total = state.get("total_experiments", 0)
-    
+
     # Extract experiment details from conversation
     exp_rows = ""
     agent_msgs = [m for m in conversation if m.get("type") != "user_message"]
@@ -244,16 +432,29 @@ def build_iteration_report(iteration: int, entry: dict, state: dict, conversatio
         text = m.get("text", "")
         for line in text.split("\n"):
             ll = line.strip()
-            if any(kw in ll.lower() for kw in ["balanced_acc", "got 0.", "achieved 0.", "result:"]):
+            if any(kw in ll.lower() for kw in ["balanced_acc", "got 0.", "achieved 0.", "result:", "bal_acc"]):
                 exp_rows += f"<tr><td style='padding:4px 8px;border-bottom:1px solid #eee;font-size:13px'>{ll[:150]}</td></tr>\n"
-    
+
+    # Build leaderboard from consolidated results
+    top = get_top_results(10)
+    leaderboard_rows = ""
+    for i, (acc, desc) in enumerate(top, 1):
+        bg = "#d4edda" if i == 1 else ("#f8f9fa" if i % 2 == 0 else "white")
+        leaderboard_rows += (
+            f"<tr style='background:{bg}'>"
+            f"<td style='padding:4px 8px;text-align:center;font-weight:bold'>{i}</td>"
+            f"<td style='padding:4px 8px;font-family:monospace;font-weight:bold'>{acc:.4f}</td>"
+            f"<td style='padding:4px 8px;font-size:12px'>{desc[:80]}</td></tr>\n"
+        )
+
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
 body {{ font-family: -apple-system, sans-serif; max-width: 700px; margin: 20px auto; color: #333; line-height: 1.5; }}
 .hdr {{ background: #1a1a2e; color: white; padding: 15px 20px; border-radius: 8px 8px 0 0; }}
 .body {{ background: #f8f9fa; padding: 15px 20px; border-radius: 0 0 8px 8px; }}
-.metric {{ font-size: 24px; font-weight: bold; color: #e94560; }}
-table {{ width: 100%; border-collapse: collapse; }}
+table {{ width: 100%; border-collapse: collapse; border: 1px solid #ddd; }}
+th {{ background: #16213e; color: white; padding: 8px; text-align: left; font-size: 13px; }}
+td {{ border-bottom: 1px solid #eee; }}
 </style></head><body>
 <div class="hdr">
 <h2 style="margin:0;color:white">Auto-Research Iteration {iteration}</h2>
@@ -261,14 +462,22 @@ table {{ width: 100%; border-collapse: collapse; }}
 </div>
 <div class="body">
 <p><strong>Status:</strong> {status} | <strong>Experiments this session:</strong> ~{experiments} | <strong>Total experiments:</strong> {total}</p>
-<p><strong>Launched:</strong> {entry.get('launched_at','')} → <strong>Finished:</strong> {entry.get('finished_at','')}</p>
+<p><strong>Launched:</strong> {entry.get('launched_at','')} &rarr; <strong>Finished:</strong> {entry.get('finished_at','')}</p>
 <p><strong>Files changed:</strong> {entry.get('files_changed',0)} | <strong>Lines added:</strong> {entry.get('lines_added',0)}</p>
 
-<h3>Experiment Log</h3>
-<table>{exp_rows or '<tr><td>No detailed results captured</td></tr>'}</table>
+<h3>Top 10 Results (All-Time Leaderboard)</h3>
+<table>
+<tr><th>#</th><th>Bal. Acc</th><th>Approach</th></tr>
+{leaderboard_rows or '<tr><td colspan="3">No results yet</td></tr>'}
+</table>
+
+<h3>This Session</h3>
+<table>
+{exp_rows or '<tr><td>No detailed results captured from conversation</td></tr>'}
+</table>
 
 <p style="font-size:12px;color:#999;margin-top:20px">
-Loop running on NAS. {state['iteration']} iterations completed so far.
+{state['iteration']} iterations completed. {total} total experiments.
 <br>View all agents: <a href="https://cursor.com/agents">cursor.com/agents</a>
 </p>
 </div></body></html>"""
@@ -350,17 +559,28 @@ def get_vt_refresh_token() -> str:
     return _read_auth_json().get("refreshToken", "")
 
 
-def build_prompt(iteration: int, latest_branch: Optional[str], prev_results: str = "") -> str:
+def build_prompt(iteration: int, latest_branch: Optional[str]) -> str:
     context_parts = []
-    if latest_branch:
-        context_parts.append(f"Previous work is on branch `{latest_branch}`. Build on it.")
-    if prev_results:
-        context_parts.append(f"Previous results summary:\n```\n{prev_results}\n```")
-    if not context_parts:
-        context_parts.append("This is the first session. Start from scratch.")
+
+    # Inject top results leaderboard directly into prompt
+    top = get_top_results(15)
+    if top:
+        best_acc = top[0][0]
+        table_rows = "\n".join(
+            f"| {i} | {acc:.4f} | {desc[:80]} |"
+            for i, (acc, desc) in enumerate(top, 1)
+        )
+        context_parts.append(
+            f"## Leaderboard — Top Results So Far\n\n"
+            f"| Rank | Bal.Acc | Approach |\n"
+            f"|------|---------|----------|\n"
+            f"{table_rows}\n\n"
+            f"**Your goal: beat {best_acc:.4f}.** Try something DIFFERENT from the approaches above."
+        )
+    else:
+        context_parts.append("No previous results. Start from the baseline in train.py.")
 
     # Refresh tokens right before launch — gives the agent a fresh 1-hour access token
-    # and a new single-use refresh token as backup
     vt_token, refresh_token = refresh_vt_tokens()
     token_block = "## API Authentication\n\nBefore running experiments, set these environment variables:\n```bash\n"
     if refresh_token:
@@ -401,21 +621,18 @@ def run_loop(max_iters: int = 999, model: str = DEFAULT_MODEL, cooldown: int = 1
         print(f"  ITERATION {iteration} — {ts}")
         print(f"{'=' * 70}")
 
-        # Always fork from main; previous results are passed via prompt context
+        # Consolidate results from all branches into main before launching
+        try:
+            consolidate_results()
+            merge_best_train()
+        except Exception as e:
+            print(f"  [consolidate] Error (non-fatal): {e}")
+
+        # Always fork from main; results are now consolidated there
         ref = "main"
         branch = f"autoresearch/liveness-v2-iter{iteration}"
 
-        # Build prompt with context from previous runs
-        prev_results = ""
-        if state.get("history"):
-            lines = []
-            for h in state["history"][-10:]:
-                lines.append(f"Iter {h['iteration']}: {h.get('status','?')} "
-                             f"— {h.get('experiments', '?')} experiments "
-                             f"— {h.get('summary', '')[:100]}")
-            prev_results = "\n".join(lines)
-
-        prompt = build_prompt(iteration, state.get("latest_branch"), prev_results)
+        prompt = build_prompt(iteration, state.get("latest_branch"))
 
         try:
             # Retry agent launch up to 3 times
