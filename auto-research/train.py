@@ -1,7 +1,8 @@
 """
 train.py — Liveness detection training script (runs on DGX1).
-Experiment: 3-stream ResNet18 shared encoder (far+near+card) with pairwise diffs + TTA
+Experiment: 3-stream ResNet18 shared encoder (far+near+card) + pairwise diffs + TTA + AMP
 Uses ALL 3 images. Pairwise embedding differences capture face-card inconsistencies.
+Optimized for speed: 160px images, 10 epochs, AMP throughout.
 """
 import os, sys, json, time, random
 import numpy as np
@@ -21,7 +22,8 @@ from sklearn.model_selection import StratifiedKFold
 DATA_DIR = Path("/mnt/nas/public2/simon/projects/auto_research/liveness-research/data")
 RESULTS_FILE = DATA_DIR / "last_result.json"
 SEED = 42
-MAX_SECONDS = 270
+MAX_SECONDS = 220
+IMG_SIZE = 160
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -60,26 +62,17 @@ class LivenessDataset3Stream(Dataset):
         sig = self.sig_ids[idx]
         info = self.labels[sig]
         label = 0 if info["main_label"] == "Positive" else 1
-        far_path = self.samples_dir / sig / "far.jpg"
-        near_path = self.samples_dir / sig / "near.jpg"
-        card_path = self.samples_dir / sig / "card.jpg"
-        try:
-            far_img = Image.open(str(far_path)).convert("RGB")
-        except Exception:
-            far_img = Image.new("RGB", (224, 224))
-        try:
-            near_img = Image.open(str(near_path)).convert("RGB")
-        except Exception:
-            near_img = Image.new("RGB", (224, 224))
-        try:
-            card_img = Image.open(str(card_path)).convert("RGB")
-        except Exception:
-            card_img = Image.new("RGB", (224, 224))
-        if self.transform:
-            far_img = self.transform(far_img)
-            near_img = self.transform(near_img)
-            card_img = self.transform(card_img)
-        return far_img, near_img, card_img, label
+        imgs = []
+        for name in ["far.jpg", "near.jpg", "card.jpg"]:
+            p = self.samples_dir / sig / name
+            try:
+                img = Image.open(str(p)).convert("RGB")
+            except Exception:
+                img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
+            if self.transform:
+                img = self.transform(img)
+            imgs.append(img)
+        return imgs[0], imgs[1], imgs[2], label
 
 
 def load_data():
@@ -106,23 +99,18 @@ def load_data():
 
 
 class ThreeStreamResNet(nn.Module):
-    """Shared ResNet18 encoder for all 3 streams + pairwise difference features."""
     def __init__(self, num_classes=2):
         super().__init__()
         base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         self.encoder = nn.Sequential(*list(base.children())[:-1])
         feat_dim = 512
-        # 3 stream features (512 each) + 3 pairwise diffs (512 each) = 3072
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(feat_dim * 6),
             nn.Dropout(0.3),
-            nn.Linear(feat_dim * 6, 512),
+            nn.Linear(feat_dim * 6, 256),
             nn.ReLU(),
-            nn.BatchNorm1d(512),
             nn.Dropout(0.2),
-            nn.Linear(512, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_classes),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, far, near, card):
@@ -144,23 +132,23 @@ def train():
     train_ids, test_ids, labels = load_data()
 
     transform_train = T.Compose([
-        T.Resize((256, 256)),
-        T.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        T.Resize((IMG_SIZE + 16, IMG_SIZE + 16)),
+        T.RandomCrop(IMG_SIZE),
         T.RandomHorizontalFlip(),
-        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        T.ColorJitter(brightness=0.15, contrast=0.15),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
     transform_test = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((IMG_SIZE, IMG_SIZE)),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
     train_ds = LivenessDataset3Stream(train_ids, labels, transform_train)
     test_ds = LivenessDataset3Stream(test_ids, labels, transform_test)
-    train_loader = DataLoader(train_ds, batch_size=24, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=48, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=6, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=6, pin_memory=True)
 
     model = ThreeStreamResNet().to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -172,7 +160,7 @@ def train():
     weight = weight / weight.sum() * 2
     criterion = nn.CrossEntropyLoss(weight=weight.to(device))
 
-    epochs = 15
+    epochs = 12
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -183,8 +171,9 @@ def train():
     best_f1 = 0
 
     for epoch in range(epochs):
-        if time.time() - t0 > MAX_SECONDS - 30:
-            print(f"Time budget approaching at epoch {epoch}")
+        elapsed_so_far = time.time() - t0
+        if elapsed_so_far > MAX_SECONDS - 30:
+            print(f"Time budget approaching at epoch {epoch} ({elapsed_so_far:.0f}s)")
             break
 
         model.train()
@@ -221,7 +210,8 @@ def train():
         acc = accuracy_score(all_labels_list, all_preds)
         f1 = f1_score(all_labels_list, all_preds, average="binary")
         avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f}")
+        elapsed = time.time() - t0
+        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} acc={acc:.4f} bal_acc={bal_acc:.4f} f1={f1:.4f} t={elapsed:.0f}s")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
@@ -229,7 +219,7 @@ def train():
             best_f1 = f1
 
     elapsed = time.time() - t0
-    approach = "3stream_resnet18_shared_encoder_pairwise_diffs_TTA_AMP"
+    approach = "3stream_resnet18_shared_pairwise_diffs_160px_TTA_AMP"
     result_block = (
         f"\n---\n"
         f"balanced_accuracy: {best_bal_acc:.6f}\n"
