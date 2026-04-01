@@ -30,3 +30,19 @@ c8ca6ed	0.966667	discard	AdaBoost 3 stumps + 2 noise - close but not perfect
 --- iter2 DGX1 deep learning experiments (real 2586-sample dataset) ---
 6dc40d3	0.976659	keep	[DGX1] ResNet18 pretrained 6ch (far+near) baseline, Adam lr=1e-4, 15 epochs
 ac32611	0.969479	discard	[DGX1] Dual-stream ResNet18 (separate far/near encoders) + OneCycleLR - worse than single stream
+--- iter11 experiments ---
+4447f2b	N/A	blocked	[DGX1] EfficientNet-B0 6ch + focal loss + RandAugment + cosine warmup - VT_TOKEN missing
+5536a12	N/A	blocked	[DGX1] ResNet50 6ch + label smoothing + MixUp + OneCycleLR - VT_TOKEN missing
+68492ba	N/A	blocked	[DGX1] Hybrid ResNet18 deep + handcrafted noise/freq features fusion - VT_TOKEN missing
+89db985	N/A	blocked	[DGX1] Dual ViT-B/16 shared encoder finetuned last 2 layers - VT_TOKEN missing
+c271025	N/A	blocked	[DGX1] Dual-stream ResNet18 + cross-attention fusion + focal loss + RandAugment - VT_TOKEN missing
+--- iter11 session 2 experiments (VT_TOKEN still missing) ---
+d90045c	N/A	blocked	[DGX1] Handcrafted noise/grad/FFT/color 36 features + RF/GBM ensemble on full dataset
+bd59b28	N/A	blocked	[DGX1] CLIP/ViT frozen encoder dual-image embeddings + MLP/RF classifier
+e2ee8ff	N/A	blocked	[DGX1] ResNet18 9ch (far+near+diff) + label smoothing + OneCycleLR + TTA
+c1de7ba	N/A	blocked	[DGX1] Multi-scale ResNet18 shared encoder (112+224+336) with far+near at each scale
+0360800	N/A	blocked	[DGX1] ConvNeXt-Tiny 6ch + CutMix + label smoothing 0.1 + strong augmentation
+--- iter12 experiments ---
+9de2fd6	0.970208	discard	[DGX1] EfficientNet-B0 6ch + focal loss + OneCycleLR + strong aug (9 epochs, 252.5s)
+a085e47	N/A	blocked	[DGX1] Hybrid ResNet18 + handcrafted noise/freq features fused MLP - token expired
+1aa02e7	N/A	blocked	[DGX1] ResNet18 6ch tuned - OneCycleLR + TTA + strong aug + grad accum - token expired
