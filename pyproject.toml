@@ -1,0 +1,22 @@
+[project]
+name = "atlas-forgery"
+version = "0.1.0"
+description = "Utilities for forgery template detection via embeddings + clustering."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "scikit-learn",
+]
+
+[project.scripts]
+atlas-cluster-join = "atlas_forgery.cli.cluster_join:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
