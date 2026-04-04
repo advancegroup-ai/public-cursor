@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forgery-detection-embeddings"
+version = "0.1.0"
+description = "Embedding utilities for document forgery detection experiments."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+onnx = ["onnxruntime>=1.17"]
+cv = ["opencv-python-headless>=4.9"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
