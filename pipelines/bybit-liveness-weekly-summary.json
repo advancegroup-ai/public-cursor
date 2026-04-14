@@ -1,0 +1,38 @@
+{
+  "pipeline_id": "bf776eea",
+  "name": "Bybit Liveness Weekly Summary",
+  "description": "Weekly Monday 9am UTC pipeline that queries Bybit liveness data (LIVENESS_SELF pass rate by region) for the past 7 days and sends a formatted summary to Lark IM. Flags regions with pass rate below 90%.",
+  "cron_expression": "0 9 * * 1",
+  "schedule": "Every Monday at 9:00 AM UTC",
+  "next_run_at": "2026-04-21T09:00:00+00:00",
+  "is_active": true,
+  "created_at": "2026-04-14T13:05:59.948014",
+  "customer_id": 9929123352,
+  "customer_name": "Bybit",
+  "threshold_pct": 90.0,
+  "nodes": [
+    {
+      "id": "sql_weekly_liveness",
+      "type": "sql_query",
+      "description": "Query last 7 days of Bybit LIVENESS_SELF pass rate by real_region from ODPS",
+      "tables": [
+        "adv_guardian_data_core.dw_advance_business_ekyc_transaction_funnel_detail",
+        "adv_guardian_data_core.dw_ekyc_uid_mapping_v2",
+        "adv_guardian_data_core.ods_sg_advance_business_ekyc_transaction_model_record",
+        "adv_guardian_data_core.ods_advance_business_ekyc_transaction_model_record"
+      ]
+    },
+    {
+      "id": "python_weekly_summary",
+      "type": "python",
+      "description": "Compute global stats, flag regions below 90% threshold, format Lark message with top-10 regions"
+    },
+    {
+      "id": "lark_weekly_alert",
+      "type": "deliver",
+      "channel": "lark_im",
+      "description": "Send weekly summary to Lark IM"
+    }
+  ],
+  "data_flow": "sql_query → python → lark_im"
+}
