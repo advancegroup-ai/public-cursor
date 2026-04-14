@@ -1,0 +1,20 @@
+{
+  "title": "Bybit Liveness Pass Rate Report — W15 2026",
+  "description": "Week 15 (Apr 7–13, 2026) liveness pass rate comparison for top 5 countries by volume",
+  "published_url": "https://prod-guardian-cv.oss-ap-southeast-5.aliyuncs.com/bybit/liveness-pass-rate/w15-2026-country-comparison/index.html",
+  "oss_key": "bybit/liveness-pass-rate/w15-2026-country-comparison/index.html",
+  "data_source": "idv_aai_liveness_details",
+  "date_range": {
+    "w15": "2026-04-07 to 2026-04-13",
+    "w14_comparison": "2026-03-31 to 2026-04-06"
+  },
+  "countries": ["PHL", "MYS", "THA", "NGA", "RUS"],
+  "key_metrics": {
+    "total_requests_w15": 420829,
+    "overall_pass_rate_w15": "97.0%",
+    "best_country": { "region": "THA", "pass_rate": "98.51%" },
+    "worst_country": { "region": "NGA", "pass_rate": "75.02%" }
+  },
+  "generated_at": "2026-04-14T13:07:00Z",
+  "generated_by": "Vibe Work Agent"
+}
