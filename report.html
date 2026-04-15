@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bybit Liveness Weekly Report — W15 2026</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg-primary: #0f172a;
+    --bg-card: #1e293b;
+    --bg-card-alt: #334155;
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent: #3b82f6;
+    --accent-light: #60a5fa;
+    --green: #22c55e;
+    --green-bg: rgba(34,197,94,0.12);
+    --red: #ef4444;
+    --red-bg: rgba(239,68,68,0.12);
+    --yellow: #eab308;
+    --yellow-bg: rgba(234,179,8,0.12);
+    --border: #334155;
+    --radius: 12px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    line-height: 1.6;
+    padding: 0;
+  }
+  .container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+  .header {
+    text-align: center;
+    padding: 48px 24px 32px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 32px;
+  }
+  .header h1 { font-size: 2rem; font-weight: 700; margin-bottom: 8px; }
+  .header .subtitle { color: var(--text-secondary); font-size: 1rem; }
+  .header .period {
+    display: inline-block;
+    background: var(--accent);
+    color: white;
+    padding: 4px 16px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-top: 12px;
+  }
+
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .kpi-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    text-align: center;
+  }
+  .kpi-card .label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+  .kpi-card .value { font-size: 2rem; font-weight: 700; }
+  .kpi-card .delta { font-size: 0.9rem; margin-top: 4px; font-weight: 500; }
+  .delta-positive { color: var(--green); }
+  .delta-negative { color: var(--red); }
+  .delta-neutral { color: var(--text-muted); }
+
+  .section { margin-bottom: 40px; }
+  .section-title {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent);
+    display: inline-block;
+  }
+
+  .alert-banner {
+    background: var(--red-bg);
+    border: 1px solid rgba(239,68,68,0.3);
+    border-radius: var(--radius);
+    padding: 16px 24px;
+    margin-bottom: 24px;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .alert-banner .icon { font-size: 1.4rem; flex-shrink: 0; margin-top: 2px; }
+  .alert-banner .content h3 { color: var(--red); font-size: 0.95rem; margin-bottom: 4px; }
+  .alert-banner .content p { color: var(--text-secondary); font-size: 0.85rem; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    font-size: 0.9rem;
+  }
+  thead th {
+    background: var(--bg-card-alt);
+    padding: 12px 16px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+  }
+  tbody td {
+    padding: 10px 16px;
+    border-bottom: 1px solid rgba(51,65,85,0.5);
+  }
+  tbody tr:hover { background: rgba(59,130,246,0.05); }
+  tbody tr.alert-row { background: var(--red-bg); }
+  tbody tr.alert-row:hover { background: rgba(239,68,68,0.18); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .badge-green { background: var(--green-bg); color: var(--green); }
+  .badge-red { background: var(--red-bg); color: var(--red); }
+  .badge-yellow { background: var(--yellow-bg); color: var(--yellow); }
+
+  .chart-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    margin-bottom: 24px;
+  }
+  .chart-container h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: var(--text-primary);
+  }
+  .chart-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+  }
+  @media (max-width: 768px) {
+    .chart-row { grid-template-columns: 1fr; }
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  .collapsible { margin-top: 32px; }
+  .collapsible summary {
+    cursor: pointer;
+    padding: 12px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 500;
+  }
+  .collapsible summary:hover { background: var(--bg-card-alt); }
+  .collapsible pre {
+    background: #0d1117;
+    color: #c9d1d9;
+    padding: 16px;
+    border-radius: 0 0 var(--radius) var(--radius);
+    overflow-x: auto;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    border: 1px solid var(--border);
+    border-top: none;
+  }
+
+  .footer {
+    text-align: center;
+    padding: 24px;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    border-top: 1px solid var(--border);
+    margin-top: 40px;
+  }
+
+  .pass-rate-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .pass-rate-bar .bar-bg {
+    flex: 1;
+    height: 6px;
+    background: var(--bg-card-alt);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .pass-rate-bar .bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+  }
+  .pass-rate-bar .rate-text {
+    font-weight: 600;
+    font-size: 0.85rem;
+    min-width: 52px;
+    text-align: right;
+  }
+
+  .insight-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin-bottom: 12px;
+  }
+  .insight-card h4 { color: var(--accent-light); font-size: 0.9rem; margin-bottom: 6px; }
+  .insight-card p { color: var(--text-secondary); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Bybit Liveness Weekly Report</h1>
+  <div class="subtitle">IDV Liveness Pass Rate Analysis by Country</div>
+  <div class="period">W15 2026 &middot; Apr 7 – Apr 13</div>
+</div>
+
+<div class="container">
+
+  <!-- KPI Summary -->
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="label">Total Transactions (W15)</div>
+      <div class="value">446.9K</div>
+      <div class="delta delta-negative">&#9660; 29.5% vs W14 (636.0K)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">Overall Pass Rate (W15)</div>
+      <div class="value" style="color: var(--accent-light)">87.23%</div>
+      <div class="delta delta-negative">&#9660; 1.82pp vs W14 (89.05%)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">Countries with &gt;2pp Drop</div>
+      <div class="value" style="color: var(--yellow)">2</div>
+      <div class="delta delta-neutral">USA (−3.56pp), ZAF (−3.67pp)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">Top Improvers</div>
+      <div class="value" style="color: var(--green)">5</div>
+      <div class="delta delta-positive">PAK +5.45pp, BGD +4.84pp</div>
+    </div>
+  </div>
+
+  <!-- Alert Banner -->
+  <div class="alert-banner">
+    <div class="icon">&#9888;&#65039;</div>
+    <div class="content">
+      <h3>Pass Rate Drop Alert — 2 Countries Exceed 2pp Threshold</h3>
+      <p><strong>USA</strong>: 95.29% → 91.73% (−3.56pp, 532 txns) — Volume also down 19.1%. Possible SDK or device mix shift.<br>
+      <strong>ZAF</strong>: 91.55% → 87.88% (−3.67pp, 66 txns) — Small volume; monitor for persistence next week.</p>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="section">
+    <div class="section-title">Daily Pass Rate Trend — W15</div>
+    <div class="chart-container">
+      <canvas id="dailyTrendChart" height="80"></canvas>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Country Comparison</div>
+    <div class="chart-row">
+      <div class="chart-container">
+        <h3>Pass Rate by Country (W14 vs W15)</h3>
+        <canvas id="countryCompChart" height="160"></canvas>
+      </div>
+      <div class="chart-container">
+        <h3>Week-over-Week Delta (pp)</h3>
+        <canvas id="deltaChart" height="160"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Volume Distribution — W15</div>
+    <div class="chart-row">
+      <div class="chart-container">
+        <h3>Transaction Volume by Country</h3>
+        <canvas id="volumeChart" height="160"></canvas>
+      </div>
+      <div class="chart-container">
+        <h3>Top 5 Countries Daily Trend</h3>
+        <canvas id="top5DailyChart" height="160"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Country Detail Table -->
+  <div class="section">
+    <div class="section-title">Country Breakdown</div>
+    <div style="overflow-x: auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Country</th>
+            <th>W15 Volume</th>
+            <th>W15 Pass Rate</th>
+            <th>W14 Pass Rate</th>
+            <th>Delta (pp)</th>
+            <th>Vol Change</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>PHL</strong></td>
+            <td>187,154</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:85.58%;background:var(--accent)"></div></div><span class="rate-text">85.58%</span></div></td>
+            <td>85.50%</td>
+            <td><span class="badge badge-green">+0.08</span></td>
+            <td>+23.9%</td>
+            <td><span class="badge badge-green">Stable</span></td>
+          </tr>
+          <tr>
+            <td><strong>MYS</strong></td>
+            <td>129,986</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:91.84%;background:var(--accent)"></div></div><span class="rate-text">91.84%</span></div></td>
+            <td>92.86%</td>
+            <td><span class="badge badge-yellow">−1.02</span></td>
+            <td>−54.6%</td>
+            <td><span class="badge badge-yellow">Watch</span></td>
+          </tr>
+          <tr>
+            <td><strong>THA</strong></td>
+            <td>77,078</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:87.08%;background:var(--accent)"></div></div><span class="rate-text">87.08%</span></div></td>
+            <td>87.34%</td>
+            <td><span class="badge badge-green">−0.26</span></td>
+            <td>−42.1%</td>
+            <td><span class="badge badge-green">Stable</span></td>
+          </tr>
+          <tr>
+            <td><strong>NGA</strong></td>
+            <td>15,681</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:73.31%;background:var(--yellow)"></div></div><span class="rate-text">73.31%</span></div></td>
+            <td>74.75%</td>
+            <td><span class="badge badge-yellow">−1.44</span></td>
+            <td>−5.1%</td>
+            <td><span class="badge badge-yellow">Watch</span></td>
+          </tr>
+          <tr>
+            <td><strong>RUS</strong></td>
+            <td>10,915</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:82.39%;background:var(--accent)"></div></div><span class="rate-text">82.39%</span></div></td>
+            <td>80.98%</td>
+            <td><span class="badge badge-green">+1.41</span></td>
+            <td>−1.8%</td>
+            <td><span class="badge badge-green">Improved</span></td>
+          </tr>
+          <tr>
+            <td><strong>EGY</strong></td>
+            <td>5,205</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:83.30%;background:var(--accent)"></div></div><span class="rate-text">83.30%</span></div></td>
+            <td>79.95%</td>
+            <td><span class="badge badge-green">+3.35</span></td>
+            <td>−7.7%</td>
+            <td><span class="badge badge-green">Improved</span></td>
+          </tr>
+          <tr>
+            <td><strong>MEX</strong></td>
+            <td>4,384</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:96.05%;background:var(--green)"></div></div><span class="rate-text">96.05%</span></div></td>
+            <td>96.21%</td>
+            <td><span class="badge badge-green">−0.16</span></td>
+            <td>−72.3%</td>
+            <td><span class="badge badge-green">Stable</span></td>
+          </tr>
+          <tr>
+            <td><strong>CHN</strong></td>
+            <td>3,197</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:87.33%;background:var(--accent)"></div></div><span class="rate-text">87.33%</span></div></td>
+            <td>83.66%</td>
+            <td><span class="badge badge-green">+3.67</span></td>
+            <td>+76.5%</td>
+            <td><span class="badge badge-green">Improved</span></td>
+          </tr>
+          <tr>
+            <td><strong>UKR</strong></td>
+            <td>2,950</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:84.71%;background:var(--accent)"></div></div><span class="rate-text">84.71%</span></div></td>
+            <td>86.71%</td>
+            <td><span class="badge badge-yellow">−2.00</span></td>
+            <td>−29.6%</td>
+            <td><span class="badge badge-yellow">Watch</span></td>
+          </tr>
+          <tr>
+            <td><strong>BRA</strong></td>
+            <td>2,542</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:86.55%;background:var(--accent)"></div></div><span class="rate-text">86.55%</span></div></td>
+            <td>84.72%</td>
+            <td><span class="badge badge-green">+1.83</span></td>
+            <td>+60.5%</td>
+            <td><span class="badge badge-green">Improved</span></td>
+          </tr>
+          <tr>
+            <td><strong>IDN</strong></td>
+            <td>1,980</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:80.40%;background:var(--yellow)"></div></div><span class="rate-text">80.40%</span></div></td>
+            <td>79.59%</td>
+            <td><span class="badge badge-green">+0.81</span></td>
+            <td>−19.0%</td>
+            <td><span class="badge badge-green">Stable</span></td>
+          </tr>
+          <tr>
+            <td><strong>BGD</strong></td>
+            <td>1,365</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:83.74%;background:var(--accent)"></div></div><span class="rate-text">83.74%</span></div></td>
+            <td>78.90%</td>
+            <td><span class="badge badge-green">+4.84</span></td>
+            <td>+13.4%</td>
+            <td><span class="badge badge-green">Improved</span></td>
+          </tr>
+          <tr>
+            <td><strong>KEN</strong></td>
+            <td>723</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:82.85%;background:var(--accent)"></div></div><span class="rate-text">82.85%</span></div></td>
+            <td>79.38%</td>
+            <td><span class="badge badge-green">+3.47</span></td>
+            <td>−13.3%</td>
+            <td><span class="badge badge-green">Improved</span></td>
+          </tr>
+          <tr>
+            <td><strong>PAK</strong></td>
+            <td>558</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:88.71%;background:var(--accent)"></div></div><span class="rate-text">88.71%</span></div></td>
+            <td>83.26%</td>
+            <td><span class="badge badge-green">+5.45</span></td>
+            <td>+29.8%</td>
+            <td><span class="badge badge-green">Improved</span></td>
+          </tr>
+          <tr>
+            <td><strong>VEN</strong></td>
+            <td>552</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:89.13%;background:var(--accent)"></div></div><span class="rate-text">89.13%</span></div></td>
+            <td>90.59%</td>
+            <td><span class="badge badge-yellow">−1.46</span></td>
+            <td>−2.0%</td>
+            <td><span class="badge badge-yellow">Watch</span></td>
+          </tr>
+          <tr class="alert-row">
+            <td><strong>USA</strong> &#9888;</td>
+            <td>532</td>
+            <td><div class="pass-rate-bar"><div class="bar-bg"><div class="bar-fill" style="width:91.73%;background:var(--red)"></div></div><span class="rate-text">91.73%</span></div></td>
+            <td>95.29%</td>
+            <td><span class="badge badge-red">−3.56</span></td>
+            <td>−19.1%</td>
+            <td><span class="badge badge-red">Alert</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Key Insights -->
+  <div class="section">
+    <div class="section-title">Key Insights</div>
+    <div class="insight-card">
+      <h4>Volume Decline Across Major Markets</h4>
+      <p>Overall volume dropped 29.5% WoW (636K → 447K). The largest drops were in MYS (−54.6%), MEX (−72.3%), and THA (−42.1%). This appears to be a normalization from W14 spikes rather than organic decline — PHL actually grew 23.9%.</p>
+    </div>
+    <div class="insight-card">
+      <h4>Pass Rate Broadly Stable Despite Volume Shift</h4>
+      <p>The overall pass rate dipped 1.82pp (89.05% → 87.23%), driven primarily by the mix shift away from high-pass-rate MYS traffic. Most countries individually held steady or improved. 7 of 16 major markets improved their pass rate WoW.</p>
+    </div>
+    <div class="insight-card">
+      <h4>USA Triggered >2pp Alert (−3.56pp)</h4>
+      <p>USA dropped from 95.29% to 91.73% with 532 W15 transactions. Combined with a 19.1% volume decline, this warrants investigation into potential SDK version changes or device-mix shifts in the US market.</p>
+    </div>
+    <div class="insight-card">
+      <h4>Emerging Markets Improving</h4>
+      <p>Several emerging markets showed strong improvement: PAK (+5.45pp), BGD (+4.84pp), CHN (+3.67pp), KEN (+3.47pp), EGY (+3.35pp). This could reflect recent model or anti-fraud rule optimizations.</p>
+    </div>
+  </div>
+
+  <!-- SQL Details -->
+  <details class="collapsible">
+    <summary>SQL Queries Used</summary>
+    <pre>
+-- W15 Liveness Pass Rate by Country (Apr 7-13, 2026)
+SELECT
+  region,
+  COUNT(*) as total_txns,
+  SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) as passed_txns,
+  ROUND(SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_liveness_details
+WHERE pt >= '20260407' AND pt <= '20260413'
+  AND CAST(customer_id AS STRING) LIKE '9929%'
+GROUP BY region
+ORDER BY total_txns DESC;
+
+-- W14 Liveness Pass Rate by Country (Mar 31 - Apr 6, 2026)
+SELECT
+  region,
+  COUNT(*) as total_txns,
+  SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) as passed_txns,
+  ROUND(SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_liveness_details
+WHERE pt >= '20260331' AND pt <= '20260406'
+  AND CAST(customer_id AS STRING) LIKE '9929%'
+GROUP BY region
+ORDER BY total_txns DESC;
+
+-- Daily Pass Rate Trend for W15
+SELECT
+  pt,
+  COUNT(*) as total_txns,
+  SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) as passed_txns,
+  ROUND(SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_liveness_details
+WHERE pt >= '20260407' AND pt <= '20260413'
+  AND CAST(customer_id AS STRING) LIKE '9929%'
+GROUP BY pt
+ORDER BY pt;
+
+-- Daily Breakdown by Top Countries for W15
+SELECT
+  pt, region,
+  COUNT(*) as total_txns,
+  SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) as passed_txns,
+  ROUND(SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_liveness_details
+WHERE pt >= '20260407' AND pt <= '20260413'
+  AND CAST(customer_id AS STRING) LIKE '9929%'
+  AND region IN ('PHL','MYS','THA','NGA','RUS','EGY','MEX','UKR','CHN','BRA','IDN','BGD')
+GROUP BY pt, region
+ORDER BY pt, total_txns DESC;
+    </pre>
+  </details>
+
+  <div class="footer">
+    Generated on Apr 15, 2026 &middot; Data source: idv_aai_liveness_details (ODPS) &middot; Bybit customer_ids (9929*)
+  </div>
+</div>
+
+<script>
+Chart.defaults.color = '#94a3b8';
+Chart.defaults.borderColor = 'rgba(51,65,85,0.5)';
+Chart.defaults.font.family = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+
+// Daily Trend Chart
+new Chart(document.getElementById('dailyTrendChart'), {
+  type: 'line',
+  data: {
+    labels: ['Apr 7', 'Apr 8', 'Apr 9', 'Apr 10', 'Apr 11', 'Apr 12', 'Apr 13'],
+    datasets: [{
+      label: 'W15 Pass Rate',
+      data: [87.86, 87.61, 87.09, 87.01, 87.07, 86.82, 86.93],
+      borderColor: '#3b82f6',
+      backgroundColor: 'rgba(59,130,246,0.1)',
+      fill: true,
+      tension: 0.3,
+      pointRadius: 5,
+      pointBackgroundColor: '#3b82f6',
+      borderWidth: 2.5
+    }, {
+      label: 'W14 Avg (89.05%)',
+      data: [89.05, 89.05, 89.05, 89.05, 89.05, 89.05, 89.05],
+      borderColor: 'rgba(148,163,184,0.5)',
+      borderDash: [6, 4],
+      pointRadius: 0,
+      borderWidth: 1.5,
+      fill: false
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: { position: 'top' },
+      tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(2) + '%' } }
+    },
+    scales: {
+      y: { min: 85, max: 91, ticks: { callback: v => v + '%' } }
+    }
+  }
+});
+
+// Country Comparison Chart
+const countries = ['PHL','MYS','THA','NGA','RUS','EGY','MEX','CHN','UKR','BRA','IDN','BGD','KEN','PAK','VEN','USA'];
+const w14Rates = [85.50,92.86,87.34,74.75,80.98,79.95,96.21,83.66,86.71,84.72,79.59,78.90,79.38,83.26,90.59,95.29];
+const w15Rates = [85.58,91.84,87.08,73.31,82.39,83.30,96.05,87.33,84.71,86.55,80.40,83.74,82.85,88.71,89.13,91.73];
+
+new Chart(document.getElementById('countryCompChart'), {
+  type: 'bar',
+  data: {
+    labels: countries,
+    datasets: [{
+      label: 'W14',
+      data: w14Rates,
+      backgroundColor: 'rgba(148,163,184,0.4)',
+      borderColor: 'rgba(148,163,184,0.7)',
+      borderWidth: 1,
+      borderRadius: 4
+    }, {
+      label: 'W15',
+      data: w15Rates,
+      backgroundColor: 'rgba(59,130,246,0.6)',
+      borderColor: 'rgba(59,130,246,0.9)',
+      borderWidth: 1,
+      borderRadius: 4
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { position: 'top' } },
+    scales: {
+      y: { min: 65, max: 100, ticks: { callback: v => v + '%' } }
+    }
+  }
+});
+
+// Delta Chart
+const deltas = [0.08, -1.02, -0.26, -1.44, 1.41, 3.35, -0.16, 3.67, -2.00, 1.83, 0.81, 4.84, 3.47, 5.45, -1.46, -3.56];
+new Chart(document.getElementById('deltaChart'), {
+  type: 'bar',
+  data: {
+    labels: countries,
+    datasets: [{
+      label: 'Delta (pp)',
+      data: deltas,
+      backgroundColor: deltas.map(d => d < -2 ? 'rgba(239,68,68,0.7)' : d < 0 ? 'rgba(234,179,8,0.5)' : 'rgba(34,197,94,0.5)'),
+      borderColor: deltas.map(d => d < -2 ? '#ef4444' : d < 0 ? '#eab308' : '#22c55e'),
+      borderWidth: 1,
+      borderRadius: 4
+    }]
+  },
+  options: {
+    responsive: true,
+    indexAxis: 'y',
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: { label: ctx => (ctx.parsed.x >= 0 ? '+' : '') + ctx.parsed.x.toFixed(2) + 'pp' } }
+    },
+    scales: {
+      x: {
+        ticks: { callback: v => (v >= 0 ? '+' : '') + v + 'pp' }
+      }
+    }
+  }
+});
+
+// Volume Chart
+const volumes = [187154,129986,77078,15681,10915,5205,4384,3197,2950,2542,1980,1365,723,558,552,532];
+new Chart(document.getElementById('volumeChart'), {
+  type: 'doughnut',
+  data: {
+    labels: countries,
+    datasets: [{
+      data: volumes,
+      backgroundColor: [
+        '#3b82f6','#60a5fa','#93c5fd','#22c55e','#4ade80','#86efac',
+        '#eab308','#facc15','#fde047','#f97316','#fb923c','#fdba74',
+        '#a855f7','#c084fc','#d8b4fe','#ef4444'
+      ],
+      borderWidth: 0
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: { position: 'right', labels: { boxWidth: 12, padding: 8, font: { size: 11 } } },
+      tooltip: { callbacks: { label: ctx => ctx.label + ': ' + ctx.parsed.toLocaleString() + ' txns' } }
+    }
+  }
+});
+
+// Top 5 Daily Trend
+const dates = ['Apr 7','Apr 8','Apr 9','Apr 10','Apr 11','Apr 12','Apr 13'];
+const phlDaily = [85.76,84.81,85.40,85.20,86.13,85.90,85.85];
+const mysDaily = [92.22,92.15,91.57,91.84,91.14,91.55,92.10];
+const thaDaily = [86.15,88.03,87.08,87.29,86.88,87.17,86.75];
+const ngaDaily = [76.01,74.94,71.31,73.89,73.89,70.12,73.46];
+const rusDaily = [80.17,82.83,82.76,83.45,83.22,84.12,79.97];
+
+new Chart(document.getElementById('top5DailyChart'), {
+  type: 'line',
+  data: {
+    labels: dates,
+    datasets: [
+      { label: 'PHL', data: phlDaily, borderColor: '#3b82f6', backgroundColor: 'transparent', tension: 0.3, pointRadius: 3, borderWidth: 2 },
+      { label: 'MYS', data: mysDaily, borderColor: '#22c55e', backgroundColor: 'transparent', tension: 0.3, pointRadius: 3, borderWidth: 2 },
+      { label: 'THA', data: thaDaily, borderColor: '#eab308', backgroundColor: 'transparent', tension: 0.3, pointRadius: 3, borderWidth: 2 },
+      { label: 'NGA', data: ngaDaily, borderColor: '#ef4444', backgroundColor: 'transparent', tension: 0.3, pointRadius: 3, borderWidth: 2 },
+      { label: 'RUS', data: rusDaily, borderColor: '#a855f7', backgroundColor: 'transparent', tension: 0.3, pointRadius: 3, borderWidth: 2 }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { position: 'top' }, tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(2) + '%' } } },
+    scales: { y: { min: 65, max: 100, ticks: { callback: v => v + '%' } } }
+  }
+});
+</script>
+
+</body>
+</html>
