@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bybit Liveness Weekly Report — W15 2026</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg-primary: #0f172a;
+    --bg-card: #1e293b;
+    --bg-card-alt: #334155;
+    --border: #475569;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent: #3b82f6;
+    --accent-light: #60a5fa;
+    --green: #22c55e;
+    --green-bg: rgba(34,197,94,0.12);
+    --red: #ef4444;
+    --red-bg: rgba(239,68,68,0.12);
+    --yellow: #eab308;
+    --yellow-bg: rgba(234,179,8,0.12);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+  .container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+  .header {
+    text-align: center;
+    margin-bottom: 40px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  .header h1 {
+    font-size: 28px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, var(--accent-light), var(--accent));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .header .subtitle {
+    color: var(--text-secondary);
+    font-size: 15px;
+  }
+  .header .meta {
+    margin-top: 12px;
+    display: flex;
+    justify-content: center;
+    gap: 24px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .header .meta span { display: flex; align-items: center; gap: 6px; }
+
+  /* KPI Cards */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .kpi-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+  }
+  .kpi-card .label {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+  }
+  .kpi-card .value {
+    font-size: 32px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+  .kpi-card .delta {
+    font-size: 14px;
+    margin-top: 4px;
+    font-weight: 600;
+  }
+  .delta-positive { color: var(--green); }
+  .delta-negative { color: var(--red); }
+  .delta-neutral { color: var(--text-muted); }
+
+  /* Section */
+  .section {
+    margin-bottom: 32px;
+  }
+  .section-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .section-title .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+
+  /* Alert Box */
+  .alert-box {
+    background: var(--red-bg);
+    border: 1px solid rgba(239,68,68,0.3);
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-bottom: 24px;
+  }
+  .alert-box .alert-title {
+    font-weight: 600;
+    color: var(--red);
+    font-size: 14px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .alert-box ul {
+    list-style: none;
+    padding-left: 0;
+  }
+  .alert-box li {
+    color: var(--text-secondary);
+    font-size: 13px;
+    padding: 4px 0;
+    display: flex;
+    justify-content: space-between;
+    border-bottom: 1px solid rgba(239,68,68,0.1);
+  }
+  .alert-box li:last-child { border-bottom: none; }
+  .alert-box .drop-val { color: var(--red); font-weight: 600; }
+
+  /* Table */
+  .table-wrapper {
+    overflow-x: auto;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  thead th {
+    background: var(--bg-card-alt);
+    color: var(--text-secondary);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 11px;
+    padding: 12px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(71,85,105,0.3);
+    white-space: nowrap;
+  }
+  tbody tr:hover { background: rgba(59,130,246,0.05); }
+  tbody tr.alert-row { background: var(--red-bg); }
+  tbody tr.alert-row:hover { background: rgba(239,68,68,0.18); }
+  .bar-cell {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .bar-bg {
+    width: 80px;
+    height: 6px;
+    background: var(--bg-card-alt);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
+  }
+
+  /* Chart */
+  .chart-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 24px;
+  }
+  .chart-wrapper {
+    position: relative;
+    height: 300px;
+  }
+
+  /* Collapsible SQL */
+  details {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-top: 32px;
+  }
+  summary {
+    padding: 12px 16px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-muted);
+    user-select: none;
+  }
+  summary:hover { color: var(--text-secondary); }
+  details pre {
+    padding: 16px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-x: auto;
+    border-top: 1px solid var(--border);
+    line-height: 1.5;
+  }
+
+  .footer {
+    text-align: center;
+    margin-top: 40px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  @media (max-width: 768px) {
+    .container { padding: 16px; }
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    .header h1 { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <h1>Bybit Liveness Weekly Report</h1>
+    <div class="subtitle">W15 2026 (April 7 – 13) vs W14 (March 31 – April 6)</div>
+    <div class="meta">
+      <span>📊 Customer ID: 9929123352</span>
+      <span>📅 Generated: 2026-04-15</span>
+      <span>📐 Source: idv_aai_liveness_details</span>
+    </div>
+  </div>
+
+  <!-- KPI Cards -->
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="label">W15 Total PV</div>
+      <div class="value">44,929</div>
+      <div class="delta delta-negative">▼ −730 vs W14 (45,659)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">W15 Overall Pass Rate</div>
+      <div class="value">86.70%</div>
+      <div class="delta delta-negative">▼ −0.24pp vs W14 (86.94%)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">W15 Pass Count</div>
+      <div class="value">38,950</div>
+      <div class="delta delta-negative">▼ −742 vs W14 (39,692)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">Countries with &gt;2pp Drop</div>
+      <div class="value" style="color: var(--red);">7</div>
+      <div class="delta delta-neutral">Flagged for review</div>
+    </div>
+  </div>
+
+  <!-- Alert: Countries with >2pp drop -->
+  <div class="alert-box">
+    <div class="alert-title">⚠ Countries with &gt;2pp Pass Rate Drop (W15 vs W14, PV ≥ 20)</div>
+    <ul>
+      <li><span>🇵🇪 PER — 100.00% → 90.48% (PV: 42)</span> <span class="drop-val">−9.52pp</span></li>
+      <li><span>🇹🇷 TUR — 100.00% → 92.31% (PV: 26)</span> <span class="drop-val">−7.69pp</span></li>
+      <li><span>🇷🇼 RWA — 100.00% → 95.00% (PV: 20)</span> <span class="drop-val">−5.00pp</span></li>
+      <li><span>🇲🇦 MAR — 100.00% → 95.00% (PV: 20)</span> <span class="drop-val">−5.00pp</span></li>
+      <li><span>🇩🇿 DZA — 100.00% → 95.24% (PV: 21)</span> <span class="drop-val">−4.76pp</span></li>
+      <li><span>🇹🇳 TUN — 96.00% → 92.00% (PV: 25)</span> <span class="drop-val">−4.00pp</span></li>
+      <li><span>🇨🇳 CHN — 87.02% → 83.85% (PV: 2,477)</span> <span class="drop-val">−3.17pp</span></li>
+    </ul>
+  </div>
+
+  <!-- Daily Trend Chart -->
+  <div class="section">
+    <div class="section-title"><span class="dot"></span> Daily Pass Rate Trend (W14 → W15)</div>
+    <div class="chart-container">
+      <div class="chart-wrapper">
+        <canvas id="trendChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Country Comparison Table -->
+  <div class="section">
+    <div class="section-title"><span class="dot"></span> Pass Rate by Country (PV ≥ 20)</div>
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Country</th>
+            <th>W15 PV</th>
+            <th>W15 Pass</th>
+            <th>W15 Pass Rate</th>
+            <th>W14 PV</th>
+            <th>W14 Pass Rate</th>
+            <th>Delta (pp)</th>
+            <th>Pass Rate Bar</th>
+          </tr>
+        </thead>
+        <tbody id="countryTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Reject Reason Breakdown -->
+  <div class="section">
+    <div class="section-title"><span class="dot"></span> Liveness Result Distribution (W15)</div>
+    <div class="chart-container">
+      <div style="display:flex; gap:32px; align-items:center; flex-wrap:wrap;">
+        <div style="width:250px; height:250px;">
+          <canvas id="pieChart"></canvas>
+        </div>
+        <div>
+          <table style="font-size:14px;">
+            <tr><td style="padding:6px 16px 6px 0; color:var(--green);">● Pass</td><td style="font-weight:700;">38,950</td><td style="padding-left:12px; color:var(--text-muted);">86.70%</td></tr>
+            <tr><td style="padding:6px 16px 6px 0; color:var(--red);">● Fail</td><td style="font-weight:700;">1,803</td><td style="padding-left:12px; color:var(--text-muted);">4.01%</td></tr>
+            <tr><td style="padding:6px 16px 6px 0; color:var(--text-muted);">● Null/Pending</td><td style="font-weight:700;">4,176</td><td style="padding-left:12px; color:var(--text-muted);">9.29%</td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SQL Section -->
+  <details>
+    <summary>📋 SQL Queries Used</summary>
+    <pre>
+-- W15 Liveness Pass Rate by Country
+SELECT
+  region,
+  COUNT(*) as total_pv,
+  SUM(CASE WHEN liveness_result1 = 'pass' THEN 1 ELSE 0 END) as pass_cnt,
+  ROUND(SUM(CASE WHEN liveness_result1 = 'pass' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_liveness_details
+WHERE customer_id = 9929123352
+  AND pt >= '20260407' AND pt <= '20260413'
+GROUP BY region
+ORDER BY total_pv DESC;
+
+-- W14 Liveness Pass Rate by Country (same query, pt range: 20260331-20260406)
+
+-- Daily Trend
+SELECT pt, COUNT(*) as total_pv,
+  SUM(CASE WHEN liveness_result1 = 'pass' THEN 1 ELSE 0 END) as pass_cnt,
+  ROUND(SUM(CASE WHEN liveness_result1 = 'pass' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_liveness_details
+WHERE customer_id = 9929123352
+  AND pt >= '20260331' AND pt <= '20260413'
+GROUP BY pt ORDER BY pt;
+
+-- Liveness Result Distribution
+SELECT liveness_result1, COUNT(*) as cnt
+FROM idv_aai_liveness_details
+WHERE customer_id = 9929123352
+  AND pt >= '20260407' AND pt <= '20260413'
+GROUP BY liveness_result1 ORDER BY cnt DESC;
+    </pre>
+  </details>
+
+  <div class="footer">
+    Bybit Liveness Weekly Report W15 2026 · Generated by Vibe Work Agent · Data source: ODPS idv_aai_liveness_details
+  </div>
+</div>
+
+<script>
+// W15 data
+const w15 = [
+  {r:"NGA",pv:15532,pass:11617,rate:74.79},
+  {r:"RUS",pv:10669,pass:10050,rate:94.20},
+  {r:"EGY",pv:5198,pass:5025,rate:96.67},
+  {r:"UKR",pv:2651,pass:2508,rate:94.61},
+  {r:"BRA",pv:2501,pass:2170,rate:86.77},
+  {r:"CHN",pv:2477,pass:2077,rate:83.85},
+  {r:"IDN",pv:1704,pass:1453,rate:85.27},
+  {r:"BGD",pv:1268,pass:1215,rate:95.82},
+  {r:"KEN",pv:680,pass:661,rate:97.21},
+  {r:"VEN",pv:542,pass:534,rate:98.52},
+  {r:"PAK",pv:475,pass:462,rate:97.26},
+  {r:"VNM",pv:285,pass:276,rate:96.84},
+  {r:"MEX",pv:208,pass:204,rate:98.08},
+  {r:"AGO",pv:195,pass:185,rate:94.87},
+  {r:"ETH",pv:90,pass:87,rate:96.67},
+  {r:"LKA",pv:50,pass:47,rate:94.00},
+  {r:"ZAF",pv:48,pass:48,rate:100.00},
+  {r:"COL",pv:43,pass:41,rate:95.35},
+  {r:"PER",pv:42,pass:38,rate:90.48},
+  {r:"TUR",pv:26,pass:24,rate:92.31},
+  {r:"TUN",pv:25,pass:23,rate:92.00},
+  {r:"DZA",pv:21,pass:20,rate:95.24},
+  {r:"SDN",pv:21,pass:20,rate:95.24},
+  {r:"RWA",pv:20,pass:19,rate:95.00},
+  {r:"MAR",pv:20,pass:19,rate:95.00},
+];
+
+// W14 data (keyed by region)
+const w14 = {
+  "NGA":{pv:16373,pass:12499,rate:76.34},
+  "RUS":{pv:10806,pass:10267,rate:95.01},
+  "EGY":{pv:5625,pass:5370,rate:95.47},
+  "UKR":{pv:3918,pass:3690,rate:94.18},
+  "IDN":{pv:2052,pass:1711,rate:83.38},
+  "BRA":{pv:1548,pass:1307,rate:84.43},
+  "CHN":{pv:1394,pass:1213,rate:87.02},
+  "BGD":{pv:1107,pass:1065,rate:96.21},
+  "KEN":{pv:780,pass:761,rate:97.56},
+  "VEN":{pv:558,pass:539,rate:96.59},
+  "PAK":{pv:351,pass:333,rate:94.87},
+  "MEX":{pv:209,pass:200,rate:95.69},
+  "AGO":{pv:202,pass:187,rate:92.57},
+  "VNM":{pv:159,pass:157,rate:98.74},
+  "LKA":{pv:83,pass:79,rate:95.18},
+  "COL":{pv:71,pass:69,rate:97.18},
+  "ETH":{pv:64,pass:62,rate:96.88},
+  "PER":{pv:48,pass:48,rate:100.00},
+  "ZAF":{pv:43,pass:40,rate:93.02},
+  "TWN":{pv:36,pass:24,rate:66.67},
+  "DZA":{pv:32,pass:32,rate:100.00},
+  "TUN":{pv:25,pass:24,rate:96.00},
+  "TUR":{pv:22,pass:22,rate:100.00},
+  "THA":{pv:18,pass:13,rate:72.22},
+  "ARG":{pv:18,pass:18,rate:100.00},
+  "IND":{pv:17,pass:17,rate:100.00},
+  "MYS":{pv:15,pass:15,rate:100.00},
+  "MAR":{pv:14,pass:14,rate:100.00},
+  "SDN":{pv:11,pass:8,rate:72.73},
+  "RWA":{pv:9,pass:9,rate:100.00},
+};
+
+// Build country table
+const tbody = document.getElementById('countryTable');
+w15.forEach(row => {
+  const prev = w14[row.r];
+  const prevRate = prev ? prev.rate : null;
+  const prevPv = prev ? prev.pv : 0;
+  const delta = prevRate !== null ? (row.rate - prevRate).toFixed(2) : 'N/A';
+  const deltaNum = parseFloat(delta);
+  const isAlert = !isNaN(deltaNum) && deltaNum < -2;
+  const deltaColor = isNaN(deltaNum) ? 'var(--text-muted)' :
+    deltaNum > 0 ? 'var(--green)' : deltaNum < -2 ? 'var(--red)' : 'var(--yellow)';
+  const deltaSign = !isNaN(deltaNum) && deltaNum > 0 ? '+' : '';
+  const barColor = row.rate >= 95 ? 'var(--green)' : row.rate >= 85 ? 'var(--accent)' : row.rate >= 75 ? 'var(--yellow)' : 'var(--red)';
+
+  const tr = document.createElement('tr');
+  if (isAlert) tr.className = 'alert-row';
+  tr.innerHTML = `
+    <td style="font-weight:600;">${row.r}</td>
+    <td>${row.pv.toLocaleString()}</td>
+    <td>${row.pass.toLocaleString()}</td>
+    <td style="font-weight:600;">${row.rate.toFixed(2)}%</td>
+    <td>${prevPv ? prevPv.toLocaleString() : '—'}</td>
+    <td>${prevRate !== null ? prevRate.toFixed(2) + '%' : '—'}</td>
+    <td style="color:${deltaColor}; font-weight:600;">${delta !== 'N/A' ? deltaSign + delta + 'pp' : delta}</td>
+    <td>
+      <div class="bar-cell">
+        <div class="bar-bg"><div class="bar-fill" style="width:${row.rate}%; background:${barColor};"></div></div>
+        <span style="font-size:11px; color:var(--text-muted);">${row.rate.toFixed(1)}%</span>
+      </div>
+    </td>
+  `;
+  tbody.appendChild(tr);
+});
+
+// Daily Trend Chart
+const dailyData = [
+  {pt:'03/31',pv:6666,rate:89.45},
+  {pt:'04/01',pv:7707,rate:87.45},
+  {pt:'04/02',pv:7144,rate:87.88},
+  {pt:'04/03',pv:6669,rate:87.55},
+  {pt:'04/04',pv:5866,rate:87.71},
+  {pt:'04/05',pv:5672,rate:85.26},
+  {pt:'04/06',pv:5935,rate:84.94},
+  {pt:'04/07',pv:5929,rate:87.69},
+  {pt:'04/08',pv:6004,rate:86.83},
+  {pt:'04/09',pv:6391,rate:85.92},
+  {pt:'04/10',pv:6531,rate:87.51},
+  {pt:'04/11',pv:6921,rate:87.98},
+  {pt:'04/12',pv:6729,rate:85.18},
+  {pt:'04/13',pv:6424,rate:85.79},
+];
+
+new Chart(document.getElementById('trendChart'), {
+  type: 'line',
+  data: {
+    labels: dailyData.map(d => d.pt),
+    datasets: [
+      {
+        label: 'Pass Rate (%)',
+        data: dailyData.map(d => d.rate),
+        borderColor: '#3b82f6',
+        backgroundColor: 'rgba(59,130,246,0.1)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 5,
+        pointBackgroundColor: dailyData.map((d,i) => i < 7 ? '#64748b' : '#3b82f6'),
+        pointBorderColor: dailyData.map((d,i) => i < 7 ? '#64748b' : '#3b82f6'),
+        yAxisID: 'y',
+      },
+      {
+        label: 'Daily PV',
+        data: dailyData.map(d => d.pv),
+        type: 'bar',
+        backgroundColor: dailyData.map((d,i) => i < 7 ? 'rgba(100,116,139,0.3)' : 'rgba(59,130,246,0.25)'),
+        borderColor: dailyData.map((d,i) => i < 7 ? 'rgba(100,116,139,0.5)' : 'rgba(59,130,246,0.5)'),
+        borderWidth: 1,
+        yAxisID: 'y1',
+        borderRadius: 4,
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { labels: { color: '#94a3b8', font: { size: 12 } } },
+      annotation: {
+        annotations: {
+          weekDivider: {
+            type: 'line',
+            xMin: 6.5,
+            xMax: 6.5,
+            borderColor: 'rgba(148,163,184,0.4)',
+            borderWidth: 2,
+            borderDash: [6,4],
+            label: {
+              display: true,
+              content: 'W14 → W15',
+              color: '#94a3b8',
+              font: { size: 11 },
+              position: 'start',
+            }
+          }
+        }
+      }
+    },
+    scales: {
+      x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(71,85,105,0.2)' } },
+      y: {
+        position: 'left',
+        min: 80, max: 100,
+        ticks: { color: '#3b82f6', callback: v => v + '%' },
+        grid: { color: 'rgba(71,85,105,0.2)' },
+        title: { display: true, text: 'Pass Rate (%)', color: '#3b82f6' }
+      },
+      y1: {
+        position: 'right',
+        min: 0,
+        ticks: { color: '#64748b' },
+        grid: { drawOnChartArea: false },
+        title: { display: true, text: 'Daily PV', color: '#64748b' }
+      }
+    }
+  }
+});
+
+// Pie Chart
+new Chart(document.getElementById('pieChart'), {
+  type: 'doughnut',
+  data: {
+    labels: ['Pass', 'Fail', 'Null/Pending'],
+    datasets: [{
+      data: [38950, 1803, 4176],
+      backgroundColor: ['#22c55e', '#ef4444', '#475569'],
+      borderColor: ['#16a34a', '#dc2626', '#334155'],
+      borderWidth: 2,
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: true,
+    cutout: '60%',
+    plugins: {
+      legend: { display: false },
+    }
+  }
+});
+</script>
+</body>
+</html>
