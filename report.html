@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PIPO (SG) RTCMY DOCUMENT 通过率下降分析 — 2025Q4 vs 2026Q1</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap');
+:root {
+  --bg: #0f172a; --surface: #1e293b; --border: #334155;
+  --text: #e2e8f0; --text-muted: #94a3b8;
+  --accent: #3b82f6; --danger: #ef4444; --success: #22c55e; --warn: #f59e0b;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); max-width: 1400px; margin: 0 auto; padding: 2rem; line-height: 1.6; }
+h1 { font-size: 1.75rem; font-weight: 800; margin-bottom: 0.25rem; }
+h2 { font-size: 1.25rem; font-weight: 700; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; color: var(--accent); }
+h3 { font-size: 1rem; font-weight: 600; margin: 1.5rem 0 0.5rem; }
+.subtitle { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+.metrics-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 1rem 0; }
+.metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; }
+.metric-value { font-family: 'JetBrains Mono', monospace; font-size: 1.5rem; font-weight: 700; }
+.metric-label { color: var(--text-muted); font-size: 0.8rem; margin-top: 0.25rem; }
+table { border-collapse: collapse; width: 100%; font-size: 0.85rem; margin: 1rem 0; }
+th { background: var(--surface); color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.75rem 1rem; text-align: left; border-bottom: 2px solid var(--border); }
+td { padding: 0.6rem 1rem; border-bottom: 1px solid var(--border); }
+tr:hover { background: rgba(59,130,246,0.05); }
+.num { font-family: 'JetBrains Mono', monospace; text-align: right; }
+.highlight-row { background: rgba(239,68,68,0.1) !important; }
+.box-red { background: rgba(239,68,68,0.1); border-left: 4px solid var(--danger); padding: 1rem 1.25rem; margin: 1rem 0; border-radius: 0 8px 8px 0; }
+.box-green { background: rgba(34,197,94,0.1); border-left: 4px solid var(--success); padding: 1rem 1.25rem; margin: 1rem 0; border-radius: 0 8px 8px 0; }
+.box-blue { background: rgba(59,130,246,0.1); border-left: 4px solid var(--accent); padding: 1rem 1.25rem; margin: 1rem 0; border-radius: 0 8px 8px 0; }
+.box-yellow { background: rgba(245,158,11,0.1); border-left: 4px solid var(--warn); padding: 1rem 1.25rem; margin: 1rem 0; border-radius: 0 8px 8px 0; }
+.chart-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin: 1rem 0; }
+code { background: rgba(59,130,246,0.15); padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; font-family: 'JetBrains Mono', monospace; }
+pre { background: #0d1117; color: #c9d1d9; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: 0.8rem; line-height: 1.5; font-family: 'JetBrains Mono', monospace; }
+details { margin: 1rem 0; }
+details summary { cursor: pointer; color: var(--accent); font-weight: 600; padding: 0.5rem 0; }
+details summary:hover { text-decoration: underline; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+.tag-critical { background: rgba(239,68,68,0.2); color: #fca5a5; }
+.tag-warning { background: rgba(245,158,11,0.2); color: #fcd34d; }
+.tag-info { background: rgba(59,130,246,0.2); color: #93c5fd; }
+.tag-ok { background: rgba(34,197,94,0.2); color: #86efac; }
+.delta-down { color: var(--danger); }
+.delta-up { color: var(--success); }
+.delta-neutral { color: var(--warn); }
+@media (max-width: 768px) { .metrics-row { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+
+<h1>PIPO (SG) RTCMY DOCUMENT 通过率下降分析</h1>
+<p class="subtitle">Customer: 9929123194 &bull; biz_code: RTCMY &bull; solution_code: DOCUMENT &bull; 分析周期: 2025Q4 vs 2026Q1 &bull; 通过率定义: front_image_shown → IDV pass (PV)</p>
+
+<h2>1. 核心结论</h2>
+
+<div class="box-red">
+<h3 style="margin-top:0;color:#fca5a5;">↘ 通过率下降 8.73pp (76.84% → 68.11%)</h3>
+<p style="margin-top:0.5rem;">下降主因不是模型或风控策略变化，而是 <b>业务结构性变化</b>：</p>
+<ol style="margin-top:0.5rem;line-height:2;">
+<li><b>MY-ID-PR 证件占比飙升</b>：PR 占比从 Q4 的 <code>1.77%</code> 升至 Q1 的 <code>18.25%</code>（+16.48pp），PR 通过率仅 <code>22.73%</code>，远低于 MYKAD 的 <code>78.25%</code></li>
+<li><b>MYKAD 通过率实际稍有上升</b>：77.71% → 78.25% (+0.54pp)，模型和风控策略未恶化</li>
+<li><b>总量大幅下降 88.5%</b>：164,376 → 18,877 PV，主要是 MYKAD 量降 90.4%，而 PR 量反而增长 18.1%</li>
+</ol>
+</div>
+
+<div class="box-green">
+<h3 style="margin-top:0;color:#86efac;">✅ 结论：产品和风控策略未恶化，下降完全由业务结构变化驱动</h3>
+<p style="margin-top:0.5rem;">MYKAD 通过率稳定，PR 证件占比急剧上升拉低了整体通过率。PR 通过率低的根因是大量用户提交了不支持的证件类型（如 MY-ID-TENTERA 军人证、外国护照等），导致 USER_TIMEOUT 和 NO_SUPPORTED_CARD 比例极高。</p>
+</div>
+
+<h2>2. 建议措施</h2>
+<div class="box-yellow">
+<ol style="line-height:2.2;">
+<li><span class="tag tag-critical">紧急</span> 确认 PIPO 业务侧 MY-ID-PR 量增长原因 — 是否新开放了 PR 证件类型的业务场景？</li>
+<li><span class="tag tag-warning">短期</span> 考虑将 MY-ID-TENTERA（军人证）加入支持的证件类型，当前因 CARD_TYPE_MISMATCH 导致大量 PR 用户失败</li>
+<li><span class="tag tag-warning">短期</span> 优化 PR 用户的前端引导，明确告知支持的证件类型，减少无效提交引起的 USER_TIMEOUT</li>
+<li><span class="tag tag-info">长期</span> 建议对 MYKAD 和 PR 分别监控通过率，避免混合指标掩盖真实趋势</li>
+</ol>
+</div>
+
+<h2>3. 数据分析</h2>
+
+<h3>3.1 季度指标对比</h3>
+<div class="metrics-row">
+<div class="metric-card">
+  <div class="metric-value" style="color:var(--danger)">-8.73pp</div>
+  <div class="metric-label">通过率变化 (76.84% → 68.11%)</div>
+</div>
+<div class="metric-card">
+  <div class="metric-value" style="color:var(--warn)">-88.5%</div>
+  <div class="metric-label">总 PV 变化 (164,376 → 18,877)</div>
+</div>
+<div class="metric-card">
+  <div class="metric-value" style="color:var(--danger)">1.77% → 18.25%</div>
+  <div class="metric-label">MY-ID-PR 占比变化</div>
+</div>
+<div class="metric-card">
+  <div class="metric-value" style="color:var(--success)">+0.54pp</div>
+  <div class="metric-label">MYKAD 通过率变化 (77.71% → 78.25%)</div>
+</div>
+</div>
+
+<table>
+<tr><th>指标</th><th class="num">2025Q4</th><th class="num">2026Q1</th><th class="num">变化</th></tr>
+<tr><td>总 PV (front_shown)</td><td class="num">164,376</td><td class="num">18,877</td><td class="num delta-down">-88.5%</td></tr>
+<tr><td>总通过 (idv_passed)</td><td class="num">126,312</td><td class="num">12,858</td><td class="num delta-down">-89.8%</td></tr>
+<tr><td>总通过率</td><td class="num">76.84%</td><td class="num">68.11%</td><td class="num delta-down">-8.73pp</td></tr>
+<tr><td>MYKAD PV</td><td class="num">161,460</td><td class="num">15,432</td><td class="num delta-down">-90.4%</td></tr>
+<tr><td>MYKAD 通过率</td><td class="num">77.71%</td><td class="num">78.25%</td><td class="num delta-up">+0.54pp</td></tr>
+<tr class="highlight-row"><td><b>PR PV</b></td><td class="num"><b>2,916</b></td><td class="num"><b>3,445</b></td><td class="num delta-up"><b>+18.1%</b></td></tr>
+<tr class="highlight-row"><td><b>PR 通过率</b></td><td class="num"><b>28.77%</b></td><td class="num"><b>22.73%</b></td><td class="num delta-down"><b>-6.04pp</b></td></tr>
+<tr class="highlight-row"><td><b>PR 占比</b></td><td class="num"><b>1.77%</b></td><td class="num"><b>18.25%</b></td><td class="num delta-down"><b>+16.48pp</b></td></tr>
+</table>
+
+<h3>3.2 月度趋势</h3>
+<div class="chart-container">
+<canvas id="monthlyChart" height="100"></canvas>
+</div>
+
+<table>
+<tr><th>月份</th><th class="num">PV</th><th class="num">通过率</th><th class="num">MYKAD 占比</th><th class="num">MYKAD 通过率</th><th class="num">PR 占比</th><th class="num">PR 通过率</th></tr>
+<tr><td>2025-10</td><td class="num">53,269</td><td class="num">76.74%</td><td class="num">98.47%</td><td class="num">77.42%</td><td class="num">1.53%</td><td class="num">32.80%</td></tr>
+<tr><td>2025-11</td><td class="num">55,133</td><td class="num">77.48%</td><td class="num">98.22%</td><td class="num">78.36%</td><td class="num">1.78%</td><td class="num">29.47%</td></tr>
+<tr><td>2025-12</td><td class="num">55,974</td><td class="num">76.31%</td><td class="num">98.00%</td><td class="num">77.35%</td><td class="num">2.00%</td><td class="num">25.22%</td></tr>
+<tr style="border-top:2px solid var(--accent);"><td><b>2026-01</b></td><td class="num">8,396</td><td class="num">71.06%</td><td class="num">88.20%</td><td class="num">77.50%</td><td class="num">11.80%</td><td class="num">22.91%</td></tr>
+<tr class="highlight-row"><td><b>2026-02</b></td><td class="num">4,946</td><td class="num">65.14%</td><td class="num">75.68%</td><td class="num">79.86%</td><td class="num">24.32%</td><td class="num">19.37%</td></tr>
+<tr class="highlight-row"><td><b>2026-03</b></td><td class="num">5,535</td><td class="num">66.31%</td><td class="num">77.40%</td><td class="num">78.13%</td><td class="num">22.60%</td><td class="num">25.82%</td></tr>
+</table>
+
+<h3>3.3 漏斗转化率分析</h3>
+<p>每个步骤相对于 front_image_shown 的累计通过率：</p>
+<table>
+<tr><th>月份</th><th class="num">front_shown</th><th class="num">scan_complete</th><th class="num">upload_backend</th><th class="num">front_check</th><th class="num">doc_check</th><th class="num">idv_passed</th></tr>
+<tr><td>2025-10</td><td class="num">100%</td><td class="num">93.95%</td><td class="num">96.03%</td><td class="num">92.12%</td><td class="num">79.06%</td><td class="num">76.74%</td></tr>
+<tr><td>2025-11</td><td class="num">100%</td><td class="num">93.87%</td><td class="num">96.25%</td><td class="num">87.82%</td><td class="num">79.95%</td><td class="num">77.48%</td></tr>
+<tr><td>2025-12</td><td class="num">100%</td><td class="num">90.53%</td><td class="num">94.84%</td><td class="num">88.40%</td><td class="num">78.88%</td><td class="num">76.31%</td></tr>
+<tr style="border-top:2px solid var(--accent);"><td><b>2026-01</b></td><td class="num">100%</td><td class="num">88.60%</td><td class="num">93.71%</td><td class="num">84.43%</td><td class="num">74.01%</td><td class="num">71.06%</td></tr>
+<tr class="highlight-row"><td><b>2026-02</b></td><td class="num">100%</td><td class="num">86.43%</td><td class="num">93.13%</td><td class="num">79.56%</td><td class="num">79.58%</td><td class="num">65.14%</td></tr>
+<tr class="highlight-row"><td><b>2026-03</b></td><td class="num">100%</td><td class="num">85.64%</td><td class="num">92.72%</td><td class="num">79.71%</td><td class="num">79.73%</td><td class="num">66.31%</td></tr>
+</table>
+
+<div class="box-blue">
+<b>漏斗发现：</b>
+<ul style="margin-top:0.5rem;line-height:1.8;">
+<li><b>scan_complete 率下降</b>：93.9% → 85.6%（-8.3pp），说明更多用户在扫描阶段放弃（PR 证件用户不确定提交什么）</li>
+<li><b>front_check 率下降</b>：92.1% → 79.7%（-12.4pp），大量 PR 用户提交了不支持的证件类型导致 doc check 失败</li>
+<li><b>doc_check → idv_passed 差距扩大</b>：2月/3月 doc_check ≈ 79.6% 但 idv_passed 仅 65-66%，当中约 13-14pp 差距主要来自 ID_FORGERY_DETECTED</li>
+</ul>
+</div>
+
+<h3>3.4 证件类型结构变化</h3>
+<div class="chart-container">
+<canvas id="docTypeChart" height="80"></canvas>
+</div>
+
+<h3>3.5 MY-ID-PR 失败原因分析（2026年2-3月）</h3>
+<p>PR 证件用户共 6,633 笔交易，主要失败原因：</p>
+<table>
+<tr><th>idv_code</th><th>doc_code</th><th class="num">数量</th><th class="num">占比</th><th>说明</th></tr>
+<tr class="highlight-row"><td><b>USER_TIMEOUT</b></td><td>(null)</td><td class="num"><b>4,531</b></td><td class="num"><b>68.3%</b></td><td>用户未完成提交就超时，可能不知道该提交什么证件</td></tr>
+<tr class="highlight-row"><td><b>USER_TIMEOUT</b></td><td>NO_SUPPORTED_CARD</td><td class="num"><b>828</b></td><td class="num"><b>12.5%</b></td><td>提交了不支持的证件后超时</td></tr>
+<tr><td>SUCCESS</td><td>SUCCESS</td><td class="num">557</td><td class="num">8.4%</td><td>成功通过</td></tr>
+<tr><td>USER_TIMEOUT</td><td>CARD_NOT_FOUND</td><td class="num">254</td><td class="num">3.8%</td><td>未识别到证件后超时</td></tr>
+<tr><td>USER_TIMEOUT</td><td>SUCCESS</td><td class="num">121</td><td class="num">1.8%</td><td>doc通过但后续步骤超时</td></tr>
+<tr><td>CARD_NOT_FOUND</td><td>CARD_NOT_FOUND</td><td class="num">117</td><td class="num">1.8%</td><td>未识别到证件</td></tr>
+<tr><td>其他</td><td>各类</td><td class="num">225</td><td class="num">3.4%</td><td>CARD_TYPE_MISMATCH, FORGERY 等</td></tr>
+</table>
+
+<div class="box-red">
+<b>关键发现：</b> PR 用户 <b>80.8%</b> 的失败来自 USER_TIMEOUT，其中大量是因为提交了不支持的证件类型（如 MY-ID-TENTERA 军人证、各国护照等）。这是用户体验问题而非风控问题。
+</div>
+
+<h3>3.6 MY-ID-PR 实际提交的证件类型（2026年3月）</h3>
+<p>以下为 doc_type=MY-ID-PR 的交易中，实际识别到的证件类型 (real_front_doc_type)：</p>
+<table>
+<tr><th>real_front_doc_type</th><th class="num">数量</th><th class="num">通过</th><th class="num">通过率</th><th>备注</th></tr>
+<tr><td>MY-ID-PR (正确)</td><td class="num">365</td><td class="num">116</td><td class="num">31.78%</td><td>匹配正确，但仍有很大失败率</td></tr>
+<tr><td>MY-ID-MYKAD</td><td class="num">260</td><td class="num">207</td><td class="num">79.62%</td><td>提交 MYKAD 但选了 PR 类型</td></tr>
+<tr class="highlight-row"><td><b>MY-ID-TENTERA</b></td><td class="num"><b>237</b></td><td class="num"><b>0</b></td><td class="num"><b>0%</b></td><td><b>军人证，不支持 → 100%失败</b></td></tr>
+<tr><td>\N (未识别)</td><td class="num">2,475</td><td class="num">0</td><td class="num">0%</td><td>未走到识别步骤就超时</td></tr>
+<tr><td>外国证件 (ID-ID-KTP, SD-PP-N等)</td><td class="num">~80</td><td class="num">0</td><td class="num">0%</td><td>非马来证件，全部失败</td></tr>
+<tr><td>其他 MY 证件</td><td class="num">~40</td><td class="num">~6</td><td class="num">~15%</td><td>MY-DL-N, MY-OTHER-N 等</td></tr>
+</table>
+
+<h3>3.7 IDV 拒绝原因分布</h3>
+<table>
+<tr><th>拒绝原因 (idv_code)</th><th class="num">2025Q4</th><th class="num">2025Q4 %</th><th class="num">2026Q1</th><th class="num">2026Q1 %</th><th>变化</th></tr>
+<tr><td>SUCCESS (PASS)</td><td class="num">126,837</td><td class="num">43.2%</td><td class="num">12,916</td><td class="num">35.1%</td><td class="delta-down">-8.1pp</td></tr>
+<tr class="highlight-row"><td><b>USER_TIMEOUT</b></td><td class="num"><b>154,236</b></td><td class="num"><b>52.6%</b></td><td class="num"><b>22,732</b></td><td class="num"><b>61.8%</b></td><td class="delta-down"><b>+9.2pp</b></td></tr>
+<tr><td>CARD_INFO_MISMATCH</td><td class="num">6,581</td><td class="num">2.2%</td><td class="num">448</td><td class="num">1.2%</td><td class="delta-up">-1.0pp</td></tr>
+<tr><td>ID_FORGERY_DETECTED</td><td class="num">4,052</td><td class="num">1.4%</td><td class="num">300</td><td class="num">0.8%</td><td class="delta-up">-0.6pp</td></tr>
+<tr><td>CARD_TYPE_MISMATCH</td><td class="num">960</td><td class="num">0.3%</td><td class="num">147</td><td class="num">0.4%</td><td class="delta-neutral">+0.1pp</td></tr>
+<tr><td>NO_SUPPORTED_CARD</td><td class="num">483</td><td class="num">0.2%</td><td class="num">107</td><td class="num">0.3%</td><td class="delta-neutral">+0.1pp</td></tr>
+<tr><td>CARD_NOT_FOUND</td><td class="num">80</td><td class="num">0.03%</td><td class="num">162</td><td class="num">0.4%</td><td class="delta-down">+0.4pp</td></tr>
+</table>
+
+<h3>3.8 通过率下降归因分解</h3>
+<div class="chart-container">
+<canvas id="waterfallChart" height="100"></canvas>
+</div>
+
+<div class="box-blue">
+<b>归因分解：</b>
+<ul style="margin-top:0.5rem;line-height:1.8;">
+<li><b>PR 占比上升效应 (Mix Shift)</b>：贡献约 <code>-8.44pp</code>（假设各证件类型通过率不变，仅占比变化带来的影响）</li>
+<li><b>PR 自身通过率下降</b>：贡献约 <code>-0.83pp</code>（PR 通过率从 28.77% → 22.73%）</li>
+<li><b>MYKAD 通过率上升</b>：抵消约 <code>+0.54pp</code></li>
+<li><b>总计</b>：-8.44 - 0.83 + 0.54 = <code>-8.73pp</code> ≈ 实际观测值</li>
+</ul>
+</div>
+
+<h2>4. 取数逻辑</h2>
+
+<h3>数据源</h3>
+<table>
+<tr><th>表</th><th>用途</th><th>关键字段</th></tr>
+<tr><td><code>dw_advance_business_ekyc_transaction_funnel_detail</code></td><td>漏斗主表</td><td>uid, is_front_image_shown, is_idv_passed, pt</td></tr>
+<tr><td><code>dw_ekyc_uid_mapping_v2</code></td><td>用户维度、biz_code、doc_type</td><td>signature_id, biz_code, doc_type, pt</td></tr>
+<tr><td><code>dw_advance_business_ekyc_transaction</code></td><td>交易详情、idv_code</td><td>signature_id, idv_code, real_front_doc_type, pt</td></tr>
+</table>
+
+<h3>过滤条件</h3>
+<ul style="line-height:1.8;">
+<li>customer_id = <code>9929123194</code></li>
+<li>solution_code = <code>DOCUMENT</code></li>
+<li>biz_code = <code>RTCMY</code> (from uid_mapping)</li>
+<li>is_front_image_shown = 1</li>
+<li>Q4: pt BETWEEN 20251001 AND 20251231</li>
+<li>Q1: pt BETWEEN 20260101 AND 20260331</li>
+</ul>
+
+<details>
+<summary>核心 SQL：月度通过率</summary>
+<pre>SELECT substr(f.pt, 1, 6) AS month_str,
+       COUNT(DISTINCT f.uid) AS total_front_shown,
+       SUM(CASE WHEN f.is_idv_passed = 1 THEN 1 ELSE 0 END) AS idv_passed
+FROM adv_guardian_data_core.dw_advance_business_ekyc_transaction_funnel_detail f
+JOIN adv_guardian_data_core.dw_ekyc_uid_mapping_v2 u
+  ON f.uid = u.signature_id AND f.pt = u.pt
+WHERE f.pt BETWEEN '20251001' AND '20260331'
+  AND f.customer_id = 9929123194
+  AND f.solution_code = 'DOCUMENT'
+  AND u.biz_code = 'RTCMY'
+  AND f.is_front_image_shown = 1
+GROUP BY substr(f.pt, 1, 6)
+ORDER BY month_str</pre>
+</details>
+
+<details>
+<summary>核心 SQL：按证件类型分解</summary>
+<pre>SELECT u.doc_type,
+       COUNT(DISTINCT f.uid) AS front_shown,
+       SUM(f.is_idv_passed) AS idv_passed
+FROM adv_guardian_data_core.dw_advance_business_ekyc_transaction_funnel_detail f
+JOIN adv_guardian_data_core.dw_ekyc_uid_mapping_v2 u
+  ON f.uid = u.signature_id AND f.pt = u.pt
+WHERE f.pt BETWEEN '{start}' AND '{end}'
+  AND f.customer_id = 9929123194
+  AND f.solution_code = 'DOCUMENT'
+  AND u.biz_code = 'RTCMY'
+  AND f.is_front_image_shown = 1
+GROUP BY u.doc_type</pre>
+</details>
+
+<details>
+<summary>核心 SQL：MY-ID-PR 失败原因</summary>
+<pre>SELECT t.idv_code, t.idv_result, t.doc_code, COUNT(*) AS cnt
+FROM adv_guardian_data_core.dw_advance_business_ekyc_transaction t
+JOIN adv_guardian_data_core.dw_ekyc_uid_mapping_v2 u
+  ON t.signature_id = u.signature_id AND t.pt = u.pt
+WHERE t.pt BETWEEN '20260201' AND '20260331'
+  AND t.customer_id = 9929123194
+  AND t.solution_code = 'DOCUMENT'
+  AND u.biz_code = 'RTCMY'
+  AND u.doc_type = 'MY-ID-PR'
+GROUP BY t.idv_code, t.idv_result, t.doc_code
+ORDER BY cnt DESC</pre>
+</details>
+
+<script>
+const ctx1 = document.getElementById('monthlyChart').getContext('2d');
+new Chart(ctx1, {
+  type: 'bar',
+  data: {
+    labels: ['2025-10', '2025-11', '2025-12', '2026-01', '2026-02', '2026-03'],
+    datasets: [{
+      label: 'PV (千)',
+      type: 'bar',
+      data: [53.3, 55.1, 56.0, 8.4, 4.9, 5.5],
+      backgroundColor: 'rgba(59,130,246,0.3)',
+      borderColor: '#3b82f6',
+      borderWidth: 1,
+      yAxisID: 'y1'
+    }, {
+      label: '总通过率',
+      type: 'line',
+      data: [76.74, 77.48, 76.31, 71.06, 65.14, 66.31],
+      borderColor: '#ef4444',
+      backgroundColor: 'rgba(239,68,68,0.1)',
+      borderWidth: 2,
+      pointRadius: 4,
+      fill: false,
+      yAxisID: 'y'
+    }, {
+      label: 'MYKAD 通过率',
+      type: 'line',
+      data: [77.42, 78.36, 77.35, 77.50, 79.86, 78.13],
+      borderColor: '#22c55e',
+      borderWidth: 2,
+      borderDash: [5, 5],
+      pointRadius: 4,
+      fill: false,
+      yAxisID: 'y'
+    }, {
+      label: 'PR 通过率',
+      type: 'line',
+      data: [32.80, 29.47, 25.22, 22.91, 19.37, 25.82],
+      borderColor: '#f59e0b',
+      borderWidth: 2,
+      borderDash: [2, 2],
+      pointRadius: 4,
+      fill: false,
+      yAxisID: 'y'
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { labels: { color: '#94a3b8' } } },
+    scales: {
+      y: { min: 0, max: 100, position: 'left', title: { display: true, text: '通过率 (%)', color: '#94a3b8' }, ticks: { color: '#94a3b8' }, grid: { color: 'rgba(51,65,85,0.5)' } },
+      y1: { min: 0, position: 'right', title: { display: true, text: 'PV (千)', color: '#94a3b8' }, ticks: { color: '#94a3b8' }, grid: { display: false } },
+      x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(51,65,85,0.3)' } }
+    }
+  }
+});
+
+const ctx2 = document.getElementById('docTypeChart').getContext('2d');
+new Chart(ctx2, {
+  type: 'bar',
+  data: {
+    labels: ['2025-10', '2025-11', '2025-12', '2026-01', '2026-02', '2026-03'],
+    datasets: [{
+      label: 'MYKAD 占比 (%)',
+      data: [98.47, 98.22, 98.00, 88.20, 75.68, 77.40],
+      backgroundColor: 'rgba(34,197,94,0.5)',
+      borderColor: '#22c55e',
+      borderWidth: 1
+    }, {
+      label: 'PR 占比 (%)',
+      data: [1.53, 1.78, 2.00, 11.80, 24.32, 22.60],
+      backgroundColor: 'rgba(239,68,68,0.5)',
+      borderColor: '#ef4444',
+      borderWidth: 1
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { labels: { color: '#94a3b8' } } },
+    scales: {
+      y: { stacked: true, max: 100, title: { display: true, text: '占比 (%)', color: '#94a3b8' }, ticks: { color: '#94a3b8' }, grid: { color: 'rgba(51,65,85,0.5)' } },
+      x: { stacked: true, ticks: { color: '#94a3b8' }, grid: { color: 'rgba(51,65,85,0.3)' } }
+    }
+  }
+});
+
+const ctx3 = document.getElementById('waterfallChart').getContext('2d');
+new Chart(ctx3, {
+  type: 'bar',
+  data: {
+    labels: ['Q4 通过率', 'PR占比上升效应', 'PR通过率下降', 'MYKAD通过率上升', 'Q1 通过率'],
+    datasets: [{
+      label: '通过率 (基础)',
+      data: [0, 76.84, 68.40, 67.57, 0],
+      backgroundColor: 'transparent',
+      borderWidth: 0
+    }, {
+      label: '变化',
+      data: [76.84, -8.44, -0.83, 0.54, 68.11],
+      backgroundColor: ['rgba(59,130,246,0.6)', 'rgba(239,68,68,0.6)', 'rgba(239,68,68,0.4)', 'rgba(34,197,94,0.6)', 'rgba(59,130,246,0.6)'],
+      borderColor: ['#3b82f6', '#ef4444', '#ef4444', '#22c55e', '#3b82f6'],
+      borderWidth: 1
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: { label: function(c) { return c.dataset.label + ': ' + c.parsed.y + 'pp'; } } }
+    },
+    scales: {
+      y: { stacked: true, min: 0, max: 100, title: { display: true, text: '通过率 (%)', color: '#94a3b8' }, ticks: { color: '#94a3b8' }, grid: { color: 'rgba(51,65,85,0.5)' } },
+      x: { stacked: true, ticks: { color: '#94a3b8', maxRotation: 45 }, grid: { display: false } }
+    }
+  }
+});
+</script>
+
+</body>
+</html>
