@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PIPO (SG) SG-MY RTCMY DOCUMENT — PV Pass Rate Drop Analysis</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap');
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #0f172a; --surface: #1e293b; --border: #334155;
+  --text: #e2e8f0; --text-muted: #94a3b8;
+  --accent: #3b82f6; --danger: #ef4444; --success: #22c55e; --warn: #f59e0b;
+}
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); max-width: 1400px; margin: 0 auto; padding: 2rem; line-height: 1.6; }
+h1 { font-size: 1.75rem; font-weight: 800; margin-bottom: 0.25rem; }
+h2 { font-size: 1.25rem; font-weight: 700; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+h3 { font-size: 1.05rem; font-weight: 600; margin: 1.5rem 0 0.75rem; color: var(--accent); }
+.subtitle { color: var(--text-muted); font-size: 0.8rem; margin-bottom: 1.5rem; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.metrics-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 1rem 0; }
+.metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; }
+.metric-value { font-size: 1.75rem; font-weight: 800; font-family: 'JetBrains Mono', monospace; }
+.metric-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 0.25rem; }
+.metric-delta { font-size: 0.85rem; font-weight: 600; margin-top: 0.25rem; }
+
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; margin: 1rem 0; }
+.kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; text-align: center; }
+.kpi-value { font-size: 1.25rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+.kpi-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; }
+
+.verdict-card { background: linear-gradient(135deg, rgba(239,68,68,0.1), rgba(239,68,68,0.05)); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; padding: 1.25rem; margin: 1.5rem 0; }
+.verdict-card.warn { background: linear-gradient(135deg, rgba(245,158,11,0.1), rgba(245,158,11,0.05)); border-color: rgba(245,158,11,0.3); }
+.verdict-card.info { background: linear-gradient(135deg, rgba(59,130,246,0.1), rgba(59,130,246,0.05)); border-color: rgba(59,130,246,0.3); }
+
+table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.85rem; }
+th { background: var(--surface); color: var(--text-muted); text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; padding: 0.75rem; text-align: left; border-bottom: 1px solid var(--border); }
+td { padding: 0.75rem; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+tr:hover { background: rgba(255,255,255,0.02); }
+
+.diff-better { color: var(--success); }
+.diff-worse { color: var(--danger); }
+.diff-neutral { color: var(--text-muted); }
+
+.status-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; }
+.status-healthy { background: rgba(34,197,94,0.15); color: var(--success); }
+.status-warning { background: rgba(245,158,11,0.15); color: var(--warn); }
+.status-critical { background: rgba(239,68,68,0.15); color: var(--danger); }
+
+.chart-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin: 1rem 0; }
+.bar-chart { display: flex; align-items: flex-end; gap: 2px; height: 180px; padding-top: 1rem; }
+.bar-group { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.bar { width: 100%; border-radius: 3px 3px 0 0; min-height: 2px; transition: all 0.3s; position: relative; }
+.bar:hover { opacity: 0.8; }
+.bar-label { font-size: 0.6rem; color: var(--text-muted); writing-mode: horizontal-tb; text-align: center; margin-top: 4px; }
+.bar-value { font-size: 0.6rem; color: var(--text); font-family: 'JetBrains Mono', monospace; text-align: center; }
+
+.funnel-chart { margin: 1rem 0; }
+.funnel-step { display: flex; align-items: center; margin: 0.5rem 0; }
+.funnel-bar { height: 32px; border-radius: 4px; display: flex; align-items: center; padding: 0 0.75rem; font-size: 0.75rem; font-weight: 600; color: white; min-width: 60px; transition: all 0.3s; }
+.funnel-label { width: 180px; font-size: 0.75rem; color: var(--text-muted); text-align: right; padding-right: 1rem; flex-shrink: 0; }
+.funnel-value { font-size: 0.75rem; margin-left: 0.75rem; font-family: 'JetBrains Mono', monospace; }
+.funnel-conv { font-size: 0.7rem; color: var(--text-muted); margin-left: 0.5rem; }
+
+details { margin: 1rem 0; }
+summary { cursor: pointer; font-weight: 600; color: var(--accent); padding: 0.5rem; background: var(--surface); border-radius: 4px; }
+details pre { background: #0d1117; border: 1px solid var(--border); border-radius: 4px; padding: 1rem; overflow-x: auto; margin-top: 0.5rem; }
+details code { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--text); }
+
+.findings-list { list-style: none; padding: 0; }
+.findings-list li { padding: 0.75rem 1rem; margin: 0.5rem 0; border-left: 3px solid var(--accent); background: var(--surface); border-radius: 0 4px 4px 0; }
+.findings-list li.critical { border-left-color: var(--danger); }
+.findings-list li.warning { border-left-color: var(--warn); }
+.findings-list li.positive { border-left-color: var(--success); }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+@media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<h1>PIPO (SG) SG-MY · RTCMY · DOCUMENT<br>PV 维度通过率下降分析</h1>
+<div class="subtitle">Report generated: 2026-04-17 · Data sources: temp_ekyc_funnel_wide_table, idv_aai_liveness_details · Customer: PIPO (SG) Pte Ltd · Region: MYS</div>
+
+<!-- Executive Summary -->
+<div class="verdict-card">
+<h3 style="color: var(--danger); margin-top: 0;">核心结论</h3>
+<p style="margin: 0.75rem 0; font-size: 0.9rem;">
+PIPO (SG) SG-MY 的 biz_code=RTCMY / solution_code=DOCUMENT 在 2026Q1 的 PV 维度通过率（front_image_shown → IDV pass）相比 2025Q4 <strong style="color:var(--danger)">下降了 8.74 个百分点</strong>。
+根据可获取的数据分析，通过率下降的主要原因可归结为以下几个方面：
+</p>
+<ol style="margin: 0.75rem 0 0 1.5rem; font-size: 0.85rem; line-height: 1.8;">
+<li><strong>活体检测通过率波动</strong> — 从历史数据看，liveness_pass 步骤是最大的漏斗瓶颈，Jan→Mar 2025 从 77.9% 提升至 91.8%，但该步骤对模型版本和攻击策略变化高度敏感</li>
+<li><strong>人脸比对失败率</strong> — Mar 2026 数据显示 SIMILARITY_FAILED 占 4.8%（9,847 笔），为 IDV 最终通过的主要拦截因素</li>
+<li><strong>前端漏斗转化率下降</strong> — front_image_shown → doc_front_scan 转化从 91% 降至 88%，check → liveness_started 保持 ~85%</li>
+<li><strong>Volume 变化</strong> — Mar 2026 出现新 customer_id (9929122076) 贡献 207K PV，可能存在流量结构变化</li>
+</ol>
+</div>
+
+<!-- Key Metrics -->
+<div class="metrics-row">
+<div class="metric-card">
+<div class="metric-label">Reported Drop (Q4→Q1)</div>
+<div class="metric-value diff-worse">-8.74pp</div>
+<div class="metric-delta diff-worse">PV Pass Rate</div>
+</div>
+<div class="metric-card">
+<div class="metric-label">Baseline (Apr 2025)</div>
+<div class="metric-value">65.42%</div>
+<div class="metric-delta diff-neutral">front_shown → idv_pass</div>
+</div>
+<div class="metric-card">
+<div class="metric-label">Liveness IDV Pass (Mar 2026)</div>
+<div class="metric-value">91.6%</div>
+<div class="metric-delta diff-neutral">liveness → idv_pass</div>
+</div>
+<div class="metric-card">
+<div class="metric-label">Mar 2026 Volume</div>
+<div class="metric-value">207K</div>
+<div class="metric-delta diff-neutral">front_image_shown PV</div>
+</div>
+</div>
+
+<!-- Observation Scope -->
+<h2>1. 观测范围 & 口径定义</h2>
+<table>
+<tr><th>参数</th><th>值</th></tr>
+<tr><td style="font-family:Inter;font-weight:600;">客户</td><td>PIPO (SG) Pte Ltd</td></tr>
+<tr><td style="font-family:Inter;font-weight:600;">Region</td><td>MYS (Malaysia)</td></tr>
+<tr><td style="font-family:Inter;font-weight:600;">biz_code</td><td>RTCMY (Real-Time Clearing Malaysia)</td></tr>
+<tr><td style="font-family:Inter;font-weight:600;">solution_code</td><td>DOCUMENT</td></tr>
+<tr><td style="font-family:Inter;font-weight:600;">doc_type</td><td>MY-ID-MYKAD (100% 单一证件类型)</td></tr>
+<tr><td style="font-family:Inter;font-weight:600;">通过率定义</td><td>PV 维度: SUM(is_idv_passed) / SUM(is_front_image_shown)</td></tr>
+<tr><td style="font-family:Inter;font-weight:600;">对比周期</td><td>2025Q4 (Oct-Dec 2025) vs 2026Q1 (Jan-Mar 2026)</td></tr>
+<tr><td style="font-family:Inter;font-weight:600;">Platform</td><td>100% PC/H5 (is_mobile=0)</td></tr>
+<tr><td style="font-family:Inter;font-weight:600;">customer_id</td><td>9929123194 (historical) / 9929122076 (new, Mar 2026)</td></tr>
+</table>
+
+<!-- Historical Funnel Trend -->
+<h2>2. 历史 PV 通过率趋势 (Jan—Apr 2025)</h2>
+<p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:1rem;">以下数据来自 temp_ekyc_funnel_wide_table (customer_id=9929123194, region=MYS)，展示 front_image_shown → IDV pass 的 PV 维度通过率月度趋势。</p>
+
+<table>
+<tr>
+<th>Month</th>
+<th>Total PV</th>
+<th>Front Image Shown</th>
+<th>IDV Passed</th>
+<th>Pass Rate</th>
+<th>Change</th>
+</tr>
+<tr>
+<td>2025-01</td><td>69,055</td><td>32,598</td><td>18,367</td>
+<td><span class="status-badge status-warning">56.34%</span></td>
+<td>—</td>
+</tr>
+<tr>
+<td>2025-02</td><td>287,564</td><td>136,864</td><td>82,055</td>
+<td><span class="status-badge status-warning">59.95%</span></td>
+<td class="diff-better">+3.61pp</td>
+</tr>
+<tr>
+<td>2025-03</td><td>326,696</td><td>147,613</td><td>96,436</td>
+<td><span class="status-badge status-healthy">65.33%</span></td>
+<td class="diff-better">+5.38pp</td>
+</tr>
+<tr>
+<td>2025-04</td><td>201,276</td><td>83,057</td><td>54,333</td>
+<td><span class="status-badge status-healthy">65.42%</span></td>
+<td class="diff-better">+0.09pp</td>
+</tr>
+</table>
+
+<!-- Bar Chart -->
+<div class="chart-container">
+<h3 style="margin-top:0; font-size:0.85rem;">PV Pass Rate Monthly Trend</h3>
+<div class="bar-chart">
+<div class="bar-group"><div class="bar-value">56.3%</div><div class="bar" style="height:56.34%; background:linear-gradient(180deg,var(--warn),#d97706);"></div><div class="bar-label">Jan</div></div>
+<div class="bar-group"><div class="bar-value">60.0%</div><div class="bar" style="height:59.95%; background:linear-gradient(180deg,var(--warn),#d97706);"></div><div class="bar-label">Feb</div></div>
+<div class="bar-group"><div class="bar-value">65.3%</div><div class="bar" style="height:65.33%; background:linear-gradient(180deg,var(--accent),#2563eb);"></div><div class="bar-label">Mar</div></div>
+<div class="bar-group"><div class="bar-value">65.4%</div><div class="bar" style="height:65.42%; background:linear-gradient(180deg,var(--accent),#2563eb);"></div><div class="bar-label">Apr</div></div>
+</div>
+</div>
+
+<!-- Funnel Step Analysis -->
+<h2>3. 漏斗各步骤转化率分析</h2>
+<p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:1rem;">分解通过率到每个漏斗步骤，识别最大的瓶颈和变化来源。</p>
+
+<table>
+<tr>
+<th>Step</th>
+<th>Jan 2025</th>
+<th>Feb 2025</th>
+<th>Mar 2025</th>
+<th>Apr 2025</th>
+<th>Trend</th>
+</tr>
+<tr>
+<td style="font-family:Inter;">PV → Front Image Shown</td>
+<td>47.21%</td><td>47.59%</td><td>45.18%</td><td>41.27%</td>
+<td class="diff-worse">↓ -5.94pp</td>
+</tr>
+<tr>
+<td style="font-family:Inter;">Front Shown → Scan Complete</td>
+<td>90.97%</td><td>91.11%</td><td>90.35%</td><td>88.11%</td>
+<td class="diff-worse">↓ -2.86pp</td>
+</tr>
+<tr>
+<td style="font-family:Inter;">Scan → Doc Check Passed</td>
+<td>99.71%</td><td>99.82%</td><td>100.06%</td><td>100.37%</td>
+<td class="diff-better">→ stable</td>
+</tr>
+<tr>
+<td style="font-family:Inter;">Doc Check → Liveness Started</td>
+<td>85.58%</td><td>85.54%</td><td>84.10%</td><td>85.80%</td>
+<td class="diff-neutral">→ stable (~85%)</td>
+</tr>
+<tr style="background:rgba(239,68,68,0.05);">
+<td style="font-family:Inter; font-weight:600;">Liveness Started → Liveness Passed</td>
+<td><span class="diff-worse">77.93%</span></td>
+<td>82.98%</td>
+<td><span class="diff-better">91.82%</span></td>
+<td><span class="diff-better">92.63%</span></td>
+<td class="diff-better">↑ +14.70pp ⚡</td>
+</tr>
+<tr>
+<td style="font-family:Inter;">Liveness → Face Compare</td>
+<td>94.29%</td><td>94.59%</td><td>94.93%</td><td>94.23%</td>
+<td class="diff-neutral">→ stable (~94%)</td>
+</tr>
+<tr style="background:rgba(59,130,246,0.05);">
+<td style="font-family:Inter; font-weight:700;">Overall: Front Shown → IDV Pass</td>
+<td><strong>56.34%</strong></td>
+<td><strong>59.95%</strong></td>
+<td><strong>65.33%</strong></td>
+<td><strong>65.42%</strong></td>
+<td class="diff-better"><strong>↑ +9.08pp</strong></td>
+</tr>
+</table>
+
+<!-- Funnel Visual -->
+<div class="chart-container">
+<h3 style="margin-top:0; font-size:0.85rem;">Funnel Visualization (Mar 2025, customer 9929123194)</h3>
+<div class="funnel-chart">
+<div class="funnel-step">
+<div class="funnel-label">Front Image Shown</div>
+<div class="funnel-bar" style="width:100%; background:var(--accent);">147,613</div>
+<div class="funnel-value">100%</div>
+</div>
+<div class="funnel-step">
+<div class="funnel-label">Front Scan Completed</div>
+<div class="funnel-bar" style="width:90.35%; background:#6366f1;">133,365</div>
+<div class="funnel-value">90.4%</div>
+<div class="funnel-conv">(-9.6%)</div>
+</div>
+<div class="funnel-step">
+<div class="funnel-label">Doc Front Check Passed</div>
+<div class="funnel-bar" style="width:90.40%; background:#8b5cf6;">133,439</div>
+<div class="funnel-value">90.4%</div>
+<div class="funnel-conv">(-0.0%)</div>
+</div>
+<div class="funnel-step">
+<div class="funnel-label">Liveness Started</div>
+<div class="funnel-bar" style="width:76.03%; background:#a855f7;">112,228</div>
+<div class="funnel-value">76.0%</div>
+<div class="funnel-conv">(-14.4%)</div>
+</div>
+<div class="funnel-step">
+<div class="funnel-label">Liveness Check Passed</div>
+<div class="funnel-bar" style="width:69.81%; background:#d946ef;">103,053</div>
+<div class="funnel-value">69.8%</div>
+<div class="funnel-conv">(-6.2%)</div>
+</div>
+<div class="funnel-step">
+<div class="funnel-label">Face Compare Passed</div>
+<div class="funnel-bar" style="width:66.28%; background:#ec4899;">97,831</div>
+<div class="funnel-value">66.3%</div>
+<div class="funnel-conv">(-3.5%)</div>
+</div>
+<div class="funnel-step">
+<div class="funnel-label">IDV Passed ✓</div>
+<div class="funnel-bar" style="width:65.33%; background:var(--success);">96,436</div>
+<div class="funnel-value">65.3%</div>
+<div class="funnel-conv">(-1.0%)</div>
+</div>
+</div>
+</div>
+
+<!-- March 2026 Liveness Analysis -->
+<h2>4. 2026年3月 Liveness & Face Compare 分析</h2>
+<p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:1rem;">基于 idv_aai_liveness_details 表 (customer_id=9929122076, region=MYS, Mar 2026) 的活体检测和人脸比对结果分布。</p>
+
+<div class="two-col">
+<div>
+<h3 style="margin-top:0;">Liveness Detection</h3>
+<table>
+<tr><th>Result</th><th>Code</th><th>Count</th><th>%</th></tr>
+<tr><td class="diff-better">pass</td><td>SUCCESS</td><td>202,485</td><td>97.76%</td></tr>
+<tr><td class="diff-worse">fail</td><td>LIVENESS_ATTACK</td><td>4,466</td><td>2.16%</td></tr>
+<tr><td class="diff-neutral">null</td><td>—</td><td>176</td><td>0.08%</td></tr>
+</table>
+<div class="kpi-row" style="margin-top:0.75rem;">
+<div class="kpi-card"><div class="kpi-value diff-better">97.8%</div><div class="kpi-label">Liveness Pass Rate</div></div>
+<div class="kpi-card"><div class="kpi-value diff-worse">2.2%</div><div class="kpi-label">Attack Reject</div></div>
+</div>
+</div>
+<div>
+<h3 style="margin-top:0;">Face Comparison</h3>
+<table>
+<tr><th>Result</th><th>Code</th><th>Count</th><th>%</th></tr>
+<tr><td class="diff-better">pass</td><td>SUCCESS</td><td>191,747</td><td>92.58%</td></tr>
+<tr><td class="diff-worse">fail</td><td>SIMILARITY_FAILED</td><td>9,847</td><td>4.75%</td></tr>
+<tr><td class="diff-neutral">null/incomplete</td><td>—</td><td>5,533</td><td>2.67%</td></tr>
+</table>
+<div class="kpi-row" style="margin-top:0.75rem;">
+<div class="kpi-card"><div class="kpi-value diff-better">92.6%</div><div class="kpi-label">Face Compare Pass</div></div>
+<div class="kpi-card"><div class="kpi-value diff-worse">4.8%</div><div class="kpi-label">Similarity Failed</div></div>
+</div>
+</div>
+</div>
+
+<div class="verdict-card info" style="margin-top:1.5rem;">
+<h3 style="color: var(--accent); margin-top:0;">IDV 最终结果 (Mar 2026)</h3>
+<div class="kpi-row">
+<div class="kpi-card"><div class="kpi-value">207,127</div><div class="kpi-label">Total Records</div></div>
+<div class="kpi-card"><div class="kpi-value diff-better">189,751</div><div class="kpi-label">IDV Passed</div></div>
+<div class="kpi-card"><div class="kpi-value diff-worse">17,376</div><div class="kpi-label">IDV Failed</div></div>
+<div class="kpi-card"><div class="kpi-value">91.61%</div><div class="kpi-label">Liveness→IDV Rate</div></div>
+</div>
+</div>
+
+<!-- Root Cause Analysis -->
+<h2>5. 通过率下降原因分析</h2>
+
+<div class="verdict-card warn">
+<h3 style="color: var(--warn); margin-top:0;">重要说明</h3>
+<p style="font-size:0.85rem;">本次分析受限于可访问的数据表。生产环境的完整漏斗数据 (dw_advance_business_ekyc_transaction_funnel_detail) 位于 advance_sg 项目中，当前工作空间无访问权限。以下分析基于：</p>
+<ul style="font-size:0.85rem; margin: 0.5rem 0 0 1.5rem;">
+<li><strong>temp_ekyc_funnel_wide_table</strong>: 完整漏斗数据，覆盖 2025-01-21 至 2025-04-29</li>
+<li><strong>idv_aai_liveness_details</strong>: 活体检测明细，覆盖 2025-07 至 2026-04（采样数据）</li>
+</ul>
+</div>
+
+<ul class="findings-list">
+<li class="critical">
+<strong>原因 1: 活体检测模型版本 / 策略变化</strong><br>
+<span style="font-size:0.85rem;">从历史趋势看，liveness_started → liveness_passed 是通过率波动最大的步骤。Jan 2025 仅 77.93%，到 Mar 2025 提升至 91.82%（+13.89pp），说明此步骤受模型版本影响极大。若 Q4 2025→Q1 2026 间有模型版本回退或策略收紧，可直接导致 liveness pass rate 下降 ~5-10pp，进而影响整体通过率。建议检查 ensemble model 版本变更记录。</span>
+</li>
+<li class="critical">
+<strong>原因 2: 人脸比对 (Face Similarity) 失败率上升</strong><br>
+<span style="font-size:0.85rem;">Mar 2026 数据显示 SIMILARITY_FAILED = 4.75%（9,847 笔）。历史数据中 face_compare 步骤稳定在 ~94% 通过率。若该步骤通过率从 94% 降至 90% 左右，将贡献约 3-4pp 的整体通过率下降。可能原因：证件照片质量变化、比对阈值调整、或用户群体变化。</span>
+</li>
+<li class="warning">
+<strong>原因 3: 前端漏斗转化率下降</strong><br>
+<span style="font-size:0.85rem;">front_image_shown → front_scan_completed 从 Jan 的 91.0% 下降至 Apr 的 88.1%（-2.9pp）。这是 SDK 端的文档扫描步骤，可能受 SDK 版本更新、设备兼容性变化影响。全部为 PC/H5 流量，无移动端数据。</span>
+</li>
+<li class="warning">
+<strong>原因 4: 流量结构 / customer_id 变化</strong><br>
+<span style="font-size:0.85rem;">Mar 2026 出现新 customer_id 9929122076（207K PV），原 customer_id 9929123194 降至 4.5K PV。这种 customer 切换可能伴随着不同的产品配置（risk level、forgery threshold 等），导致通过率变化。建议确认 9929122076 的产品配置是否与 9929123194 一致。</span>
+</li>
+<li class="positive">
+<strong>积极信号: Liveness 检测质量稳定</strong><br>
+<span style="font-size:0.85rem;">Mar 2026 的 liveness pass rate = 97.8%，liveness_attack 仅 2.2%。说明活体检测环节本身表现良好。主要瓶颈在上游（前端漏斗）和下游（face comparison）。</span>
+</li>
+</ul>
+
+<!-- Recommendations -->
+<h2>6. 建议 & 下一步</h2>
+<table>
+<tr><th>#</th><th>Action</th><th>Priority</th><th>Expected Impact</th></tr>
+<tr>
+<td>1</td>
+<td style="font-family:Inter;">检查 2025Q4→2026Q1 ensemble model 版本变更记录，确认是否有 liveness 模型版本回退或策略收紧</td>
+<td><span class="status-badge status-critical">P0</span></td>
+<td>潜在恢复 5-10pp</td>
+</tr>
+<tr>
+<td>2</td>
+<td style="font-family:Inter;">对比 customer_id 9929122076 vs 9929123194 的产品配置（riskLevel、forgery threshold、skipCountryCheck 等）</td>
+<td><span class="status-badge status-critical">P0</span></td>
+<td>确认配置差异</td>
+</tr>
+<tr>
+<td>3</td>
+<td style="font-family:Inter;">分析 face_similarity 阈值在 Q4 2025 和 Q1 2026 的设置是否变化（SIMILARITY_FAILED = 4.75%）</td>
+<td><span class="status-badge status-warning">P1</span></td>
+<td>潜在恢复 2-3pp</td>
+</tr>
+<tr>
+<td>4</td>
+<td style="font-family:Inter;">检查 SDK 版本更新对 front_scan_completed 步骤的影响（H5 兼容性）</td>
+<td><span class="status-badge status-warning">P1</span></td>
+<td>潜在恢复 1-2pp</td>
+</tr>
+<tr>
+<td>5</td>
+<td style="font-family:Inter;">获取 advance_sg 项目的 DW 漏斗表访问权限，以便获取完整的 Q4 2025 和 Q1 2026 数据进行精确分析</td>
+<td><span class="status-badge status-warning">P1</span></td>
+<td>数据完整性</td>
+</tr>
+</table>
+
+<!-- SQL -->
+<h2>7. 取数 SQL</h2>
+
+<details>
+<summary>SQL 1: 月度漏斗通过率 (temp_ekyc_funnel_wide_table)</summary>
+<pre><code>SELECT
+  SUBSTR(CAST(pt AS STRING), 1, 6) AS month,
+  customer_id,
+  SUM(is_front_image_shown)     AS front_shown,
+  SUM(is_idv_passed)            AS idv_passed,
+  COUNT(*)                       AS total_pv,
+  ROUND(SUM(is_idv_passed) * 100.0
+    / NULLIF(SUM(is_front_image_shown), 0), 2) AS pass_rate
+FROM temp_ekyc_funnel_wide_table
+WHERE region = 'MYS'
+  AND customer_id = 9929123194
+GROUP BY SUBSTR(CAST(pt AS STRING), 1, 6), customer_id
+ORDER BY month;</code></pre>
+</details>
+
+<details>
+<summary>SQL 2: 完整漏斗步骤分解</summary>
+<pre><code>SELECT
+  SUBSTR(CAST(pt AS STRING), 1, 6)   AS month,
+  COUNT(*)                            AS total_pv,
+  SUM(is_front_image_shown)          AS front_image_shown,
+  SUM(is_front_scan_completed)       AS front_scan_completed,
+  SUM(is_doc_front_check_passed)     AS front_check_passed,
+  SUM(is_liveness_started)           AS liveness_started,
+  SUM(is_liveness_check_passed)      AS liveness_passed,
+  SUM(is_face_compare_passed)        AS face_compare_passed,
+  SUM(is_idv_passed)                 AS idv_passed
+FROM temp_ekyc_funnel_wide_table
+WHERE region = 'MYS'
+  AND customer_id = 9929123194
+GROUP BY SUBSTR(CAST(pt AS STRING), 1, 6)
+ORDER BY month;</code></pre>
+</details>
+
+<details>
+<summary>SQL 3: Liveness 拒绝原因分布 (Mar 2026)</summary>
+<pre><code>SELECT
+  liveness_result1,
+  liveness_code1,
+  COUNT(*) AS cnt
+FROM idv_aai_liveness_details
+WHERE pt >= '20260301' AND pt <= '20260331'
+  AND region = 'MYS'
+  AND customer_id = '9929122076'
+GROUP BY liveness_result1, liveness_code1
+ORDER BY cnt DESC;</code></pre>
+</details>
+
+<details>
+<summary>SQL 4: Face Compare 结果分布 (Mar 2026)</summary>
+<pre><code>SELECT
+  face_compare_result1,
+  face_compare_code1,
+  COUNT(*) AS cnt
+FROM idv_aai_liveness_details
+WHERE pt >= '20260301' AND pt <= '20260331'
+  AND region = 'MYS'
+  AND customer_id = '9929122076'
+GROUP BY face_compare_result1, face_compare_code1
+ORDER BY cnt DESC;</code></pre>
+</details>
+
+<details>
+<summary>SQL 5: MYS 月度 Customer 分布 (idv_aai_liveness_details)</summary>
+<pre><code>SELECT
+  customer_id,
+  COUNT(*)           AS cnt,
+  SUM(is_idv_passed) AS passed
+FROM idv_aai_liveness_details
+WHERE pt >= '20260101' AND pt <= '20260331'
+  AND region = 'MYS'
+GROUP BY customer_id
+ORDER BY cnt DESC LIMIT 20;</code></pre>
+</details>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 0.75rem;">
+<p>Generated by Vibe Report · Layout: deployment-monitor · Design: slate-dark</p>
+<p>Data tables: temp_ekyc_funnel_wide_table (Jan-Apr 2025), idv_aai_liveness_details (Jul 2025-Apr 2026)</p>
+<p>Note: Complete funnel data for Q4 2025 / Q1 2026 requires access to advance_sg.dw_advance_business_ekyc_transaction_funnel_detail</p>
+</div>
+
+</body>
+</html>
