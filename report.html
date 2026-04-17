@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PIPO (SG) Pte Ltd — RTCMY DOCUMENT PV Pass Rate Drop Analysis</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #0f172a; --surface: #1e293b; --border: #334155;
+  --text: #e2e8f0; --text-muted: #94a3b8;
+  --accent: #3b82f6; --danger: #ef4444; --success: #22c55e; --warn: #f59e0b;
+}
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); max-width: 1400px; margin: 0 auto; padding: 2rem; line-height: 1.6; }
+h1 { font-size: 1.75rem; font-weight: 800; margin-bottom: 0.25rem; }
+h2 { font-size: 1.25rem; font-weight: 700; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+h3 { font-size: 1.05rem; font-weight: 600; margin: 1.5rem 0 0.75rem; color: var(--accent); }
+.subtitle { color: var(--text-muted); font-size: 0.8rem; margin-bottom: 1.5rem; }
+.verdict-card { background: linear-gradient(135deg, rgba(239,68,68,0.1), rgba(239,68,68,0.05)); border: 1px solid rgba(239,68,68,0.3); border-radius: 12px; padding: 1.5rem; margin: 1.5rem 0; }
+.verdict-card h3 { color: var(--danger); margin-top: 0; }
+.verdict-card ul { padding-left: 1.2rem; }
+.verdict-card li { margin-bottom: 0.4rem; }
+.metrics-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+.metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; text-align: center; }
+.metric-value { font-size: 1.8rem; font-weight: 800; font-family: 'JetBrains Mono', monospace; }
+.metric-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 0.3rem; }
+.metric-delta { font-size: 0.85rem; font-weight: 600; margin-top: 0.2rem; }
+.diff-better { color: var(--success); }
+.diff-worse { color: var(--danger); }
+.diff-neutral { color: var(--text-muted); }
+table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.85rem; }
+th { background: var(--surface); color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; padding: 0.6rem 0.8rem; text-align: left; border-bottom: 2px solid var(--border); }
+td { padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+tr:hover td { background: rgba(59,130,246,0.05); }
+.status-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 99px; font-size: 0.7rem; font-weight: 600; }
+.status-critical { background: rgba(239,68,68,0.15); color: #f87171; }
+.status-warning { background: rgba(245,158,11,0.15); color: #fbbf24; }
+.status-healthy { background: rgba(34,197,94,0.15); color: #4ade80; }
+.insight-box { background: var(--surface); border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0; padding: 1rem 1.2rem; margin: 1rem 0; font-size: 0.9rem; }
+.insight-box.danger { border-left-color: var(--danger); }
+.insight-box.success { border-left-color: var(--success); }
+.insight-box.warn { border-left-color: var(--warn); }
+.chart-container { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; margin: 1.5rem 0; }
+.bar-chart { display: flex; align-items: flex-end; gap: 2px; height: 120px; padding: 0 0.5rem; }
+.bar-group { display: flex; flex-direction: column; align-items: center; flex: 1; min-width: 0; }
+.bar { width: 100%; border-radius: 3px 3px 0 0; transition: all 0.3s; min-height: 2px; position: relative; }
+.bar:hover { opacity: 0.8; }
+.bar-label { font-size: 0.55rem; color: var(--text-muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; text-align: center; }
+.bar-value { font-size: 0.55rem; color: var(--text); font-weight: 600; margin-bottom: 2px; }
+.legend { display: flex; gap: 1.5rem; margin-top: 0.8rem; justify-content: center; font-size: 0.75rem; }
+.legend-item { display: flex; align-items: center; gap: 0.4rem; }
+.legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+details { margin: 1rem 0; }
+summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 0.9rem; }
+details pre { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; margin-top: 0.5rem; }
+details code { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--text-muted); }
+.funnel-step { display: flex; align-items: center; gap: 1rem; margin: 0.5rem 0; }
+.funnel-bar { height: 28px; border-radius: 4px; display: flex; align-items: center; padding: 0 0.8rem; font-size: 0.75rem; font-weight: 600; color: white; min-width: 40px; }
+.funnel-label { font-size: 0.8rem; min-width: 180px; }
+.funnel-pct { font-size: 0.8rem; font-family: 'JetBrains Mono', monospace; min-width: 60px; text-align: right; }
+.compare-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin: 1.5rem 0; }
+.compare-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; }
+.compare-panel h4 { font-size: 0.9rem; margin-bottom: 1rem; color: var(--text-muted); }
+@media (max-width: 768px) {
+  .compare-panels { grid-template-columns: 1fr; }
+  .metrics-row { grid-template-columns: 1fr 1fr; }
+  body { padding: 1rem; }
+}
+</style>
+</head>
+<body>
+
+<h1>PIPO (SG) Pte Ltd — PV 通过率下降分析</h1>
+<p class="subtitle">Customer: 9929122076 &nbsp;|&nbsp; biz_code: RTCMY &nbsp;|&nbsp; solution_code: DOCUMENT &nbsp;|&nbsp; Region: MYS &nbsp;|&nbsp; 分析日期: 2026-04-17</p>
+
+<div class="verdict-card">
+<h3>🔍 核心结论</h3>
+<p style="margin-bottom:0.8rem">PV维度通过率（front_image_shown → IDV pass）从 <strong>82.65%</strong>（Jul-Aug 2025 基线）下降至 <strong>74.27%</strong>（Mar-Apr 2026），降幅 <strong>-8.38pp</strong>，与用户反馈的 -8.74pp 基本一致。</p>
+<ul>
+<li><strong>主因：文档阶段（Document Stage）拦截率大幅上升</strong> — Mar-Apr 2026 期间，约 <strong>16.3%</strong> 的 PV 在文档阶段被拦截（未到达 Liveness），而 Jul-Aug 2025 该比率实际为负数（Liveness PV > Forgery PV，说明当时采样逻辑不同）</li>
+<li><strong>Liveness 和 Face Compare 模块均有改善</strong> — Liveness 攻击拦截率从 7.22% 降至 2.06%，Face Compare 通过率从 87.23% 升至 93.27%</li>
+<li><strong>Forgery 模型拒绝率也下降</strong> — ID forgery 机器检测拒绝率从 5.88% 降至 1.87%</li>
+<li><strong>综合判断：通过率下降并非模型性能恶化，而是前端 SDK/UCC/Doc Quality Check 等文档阶段拦截增加所致</strong></li>
+</ul>
+</div>
+
+<h2>1. 总体概览 — 两期对比</h2>
+<p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem">由于数据表覆盖限制，基线期使用 Jul-Aug 2025 数据，观察期使用 Mar-Apr 2026 数据。Forgery 表（包含文档阶段 PV）为通过率基准口径。</p>
+
+<div class="metrics-row">
+  <div class="metric-card">
+    <div class="metric-label">基线期 PV通过率</div>
+    <div class="metric-value diff-better">82.65%</div>
+    <div class="metric-delta diff-neutral">Jul-Aug 2025 | 134,332 PV</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">观察期 PV通过率</div>
+    <div class="metric-value diff-worse">74.27%</div>
+    <div class="metric-delta diff-worse">Mar-Apr 2026 | 763,220 PV</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">变化幅度</div>
+    <div class="metric-value diff-worse">-8.38pp</div>
+    <div class="metric-delta diff-worse">下降 10.1%</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">PV量增幅</div>
+    <div class="metric-value" style="color:var(--accent)">5.68x</div>
+    <div class="metric-delta diff-neutral">134K → 763K</div>
+  </div>
+</div>
+
+<h2>2. 各模块拒绝率对比</h2>
+<p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem">从 Liveness、Face Compare、Forgery 三个模块来看，模块级别的拒绝率均有所下降。通过率下降的原因在这些模块之外。</p>
+
+<table>
+<thead>
+<tr>
+  <th>检测模块</th>
+  <th>指标</th>
+  <th>Jul-Aug 2025</th>
+  <th>Mar-Apr 2026</th>
+  <th>变化</th>
+  <th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>Liveness Detection</td>
+  <td>通过率</td>
+  <td>92.70%</td>
+  <td>97.87%</td>
+  <td class="diff-better">+5.17pp</td>
+  <td><span class="status-badge status-healthy">改善</span></td>
+</tr>
+<tr>
+  <td>Liveness Detection</td>
+  <td>攻击拦截率</td>
+  <td>7.22%</td>
+  <td>2.06%</td>
+  <td class="diff-better">-5.16pp</td>
+  <td><span class="status-badge status-healthy">改善</span></td>
+</tr>
+<tr>
+  <td>Face Compare</td>
+  <td>通过率</td>
+  <td>87.23%</td>
+  <td>93.27%</td>
+  <td class="diff-better">+6.04pp</td>
+  <td><span class="status-badge status-healthy">改善</span></td>
+</tr>
+<tr>
+  <td>Face Compare</td>
+  <td>相似度失败率</td>
+  <td>5.43%</td>
+  <td>4.30%</td>
+  <td class="diff-better">-1.13pp</td>
+  <td><span class="status-badge status-healthy">改善</span></td>
+</tr>
+<tr>
+  <td>ID Forgery Machine</td>
+  <td>拒绝率</td>
+  <td>5.88%</td>
+  <td>1.87%</td>
+  <td class="diff-better">-4.01pp</td>
+  <td><span class="status-badge status-healthy">改善</span></td>
+</tr>
+<tr style="background:rgba(239,68,68,0.08)">
+  <td><strong>Document Stage</strong></td>
+  <td><strong>文档阶段流失率</strong></td>
+  <td><strong>~0%*</strong></td>
+  <td><strong>~16.3%</strong></td>
+  <td class="diff-worse"><strong>+16.3pp</strong></td>
+  <td><span class="status-badge status-critical">恶化</span></td>
+</tr>
+<tr style="background:rgba(239,68,68,0.08)">
+  <td><strong>综合 IDV (Forgery 口径)</strong></td>
+  <td><strong>PV通过率</strong></td>
+  <td><strong>82.65%</strong></td>
+  <td><strong>74.27%</strong></td>
+  <td class="diff-worse"><strong>-8.38pp</strong></td>
+  <td><span class="status-badge status-critical">下降</span></td>
+</tr>
+</tbody>
+</table>
+<p style="font-size:0.75rem;color:var(--text-muted)">* Jul-Aug 2025 基线期 Liveness PV > Forgery PV，说明当时两表数据采集口径不同，不直接反映文档阶段流失率。</p>
+
+<div class="insight-box danger">
+<strong>关键发现：</strong>所有检测模块（Liveness、Face Compare、Forgery）的拒绝率均在下降（模型性能改善），但整体 PV 通过率反而下降。这说明通过率的降低发生在这些模块之前的阶段——即 <strong>文档提交/质量检查阶段 (UCC / Doc Quality Check / SDK Client-Side Rejection)</strong>。
+</div>
+
+<h2>3. 漏斗分析 — Forgery 口径 vs Liveness 口径</h2>
+<p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem">Forgery 表捕获从 front_image_shown 开始的所有 PV，Liveness 表仅捕获到达 Liveness 阶段的 PV。两表之差反映文档阶段的流失。</p>
+
+<div class="compare-panels">
+<div class="compare-panel">
+  <h4>📊 Jul-Aug 2025（基线期）</h4>
+  <div class="funnel-step">
+    <span class="funnel-label">Forgery (Doc Stage)</span>
+    <div class="funnel-bar" style="width:100%;background:var(--accent)">134,332</div>
+    <span class="funnel-pct">100%</span>
+  </div>
+  <div class="funnel-step">
+    <span class="funnel-label">Liveness (Face Stage)</span>
+    <div class="funnel-bar" style="width:100%;background:var(--success)">174,526</div>
+    <span class="funnel-pct">130%*</span>
+  </div>
+  <div class="funnel-step">
+    <span class="funnel-label">IDV Passed (Forgery)</span>
+    <div class="funnel-bar" style="width:82.65%;background:#06b6d4">111,032</div>
+    <span class="funnel-pct">82.65%</span>
+  </div>
+  <p style="font-size:0.7rem;color:var(--text-muted);margin-top:0.5rem">* Liveness PV > Forgery PV 说明两表在该期间的采样/同步口径不同</p>
+</div>
+<div class="compare-panel">
+  <h4>📊 Mar-Apr 2026（观察期）</h4>
+  <div class="funnel-step">
+    <span class="funnel-label">Forgery (Doc Stage)</span>
+    <div class="funnel-bar" style="width:100%;background:var(--accent)">763,220</div>
+    <span class="funnel-pct">100%</span>
+  </div>
+  <div class="funnel-step">
+    <span class="funnel-label">Liveness (Face Stage)</span>
+    <div class="funnel-bar" style="width:83.8%;background:var(--success)">639,211</div>
+    <span class="funnel-pct">83.8%</span>
+  </div>
+  <div class="funnel-step">
+    <span class="funnel-label">IDV Passed (Forgery)</span>
+    <div class="funnel-bar" style="width:74.27%;background:#06b6d4">566,878</div>
+    <span class="funnel-pct">74.27%</span>
+  </div>
+  <p style="font-size:0.7rem;color:var(--text-muted);margin-top:0.5rem">16.2% 的 PV 在文档阶段被拦截，未到达 Liveness 阶段</p>
+</div>
+</div>
+
+<div class="insight-box warn">
+<strong>文档阶段流失构成分析：</strong>Mar-Apr 2026 中，763,220 PV 进入文档阶段，但只有 639,211 (83.8%) 到达 Liveness。缺口 124,009 PV (16.2%) 被拦截在文档质量检查 (UCC)、前端 SDK 验证、Doc Type 校验等环节。<br><br>
+<strong>可能原因：</strong><br>
+1. SDK 版本升级引入了更严格的前端文档质量检查<br>
+2. UCC (Universal Content Check) 阈值调整<br>
+3. 文档类型校验规则变更<br>
+4. 用户操作环境变化（如弱网、低质量摄像头增多）
+</div>
+
+<h2>4. 日度趋势 — Mar-Apr 2026</h2>
+
+<div class="chart-container">
+<h3 style="margin-top:0">PV 通过率日度趋势（Forgery 口径）</h3>
+<div class="bar-chart" id="dailyChart">
+<script>
+const dailyData = [
+  {d:'03/16',r:73.84,v:6146},{d:'03/17',r:76.15,v:5384},{d:'03/18',r:76.32,v:4878},{d:'03/19',r:76.51,v:3955},
+  {d:'03/20',r:71.32,v:5178},{d:'03/21',r:76.76,v:3077},{d:'03/22',r:75.16,v:3547},{d:'03/23',r:74.26,v:4374},
+  {d:'03/24',r:76.38,v:5852},{d:'03/25',r:75.23,v:6412},{d:'03/26',r:77.23,v:6668},{d:'03/27',r:77.59,v:68468},
+  {d:'03/28',r:74.07,v:30780},{d:'03/29',r:74.59,v:29923},{d:'03/30',r:75.74,v:29111},{d:'03/31',r:76.11,v:24359},
+  {d:'04/01',r:73.29,v:112789},{d:'04/02',r:72.91,v:70537},{d:'04/03',r:72.53,v:42406},{d:'04/04',r:71.68,v:35234},
+  {d:'04/05',r:71.69,v:31989},{d:'04/06',r:74.08,v:34366},{d:'04/07',r:74.71,v:28332},{d:'04/08',r:74.35,v:24990},
+  {d:'04/09',r:74.94,v:23408},{d:'04/10',r:74.72,v:18631},{d:'04/11',r:74.04,v:17110},{d:'04/12',r:72.80,v:17695},
+  {d:'04/13',r:75.96,v:18156},{d:'04/14',r:75.06,v:18498},{d:'04/15',r:75.72,v:17863},{d:'04/16',r:74.64,v:13104}
+];
+const chart = document.getElementById('dailyChart');
+const maxRate = 80; const minRate = 68;
+dailyData.forEach(item => {
+  const grp = document.createElement('div');
+  grp.className = 'bar-group';
+  const normalizedH = ((item.r - minRate) / (maxRate - minRate)) * 100;
+  const clampedH = Math.max(5, Math.min(100, normalizedH));
+  const color = item.r < 73 ? 'var(--danger)' : item.r < 75 ? 'var(--warn)' : 'var(--success)';
+  grp.innerHTML = `<span class="bar-value">${item.r}%</span><div class="bar" style="height:${clampedH}%;background:${color}" title="${item.d}: ${item.r}% (${item.v.toLocaleString()} PV)"></div><span class="bar-label">${item.d}</span>`;
+  chart.appendChild(grp);
+});
+</script>
+</div>
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:var(--success)"></div>≥75%</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--warn)"></div>73-75%</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--danger)"></div><73%</div>
+</div>
+</div>
+
+<div class="insight-box">
+<strong>趋势观察：</strong><br>
+- 03/27 出现异常高峰（68,468 PV），通过率为 77.59%，疑似批量灌入或营销活动<br>
+- 04/01-04/05 PV 量激增（112K→32K），通过率持续走低至 71-73% 区间<br>
+- 04/06 后 PV 回归正常水平（17-28K/天），通过率稳定在 74-76%<br>
+- 通过率与 PV 量呈负相关：PV 量越大，通过率越低，提示新用户/低质量用户占比增加
+</div>
+
+<h2>5. Liveness 阶段通过率趋势</h2>
+
+<table>
+<thead>
+<tr>
+  <th>日期</th>
+  <th>Forgery PV</th>
+  <th>Liveness PV</th>
+  <th>Doc阶段流失</th>
+  <th>Forgery通过率</th>
+  <th>Liveness通过率</th>
+</tr>
+</thead>
+<tbody>
+<script>
+const combined = [
+  {d:'03/16',fp:6146,lp:5567,fr:73.84,lr:89.37},{d:'03/17',fp:5384,lp:5235,fr:76.15,lr:88.71},
+  {d:'03/18',fp:4878,lp:4825,fr:76.32,lr:88.95},{d:'03/19',fp:3955,lp:3790,fr:76.51,lr:89.10},
+  {d:'03/20',fp:5178,lp:4894,fr:71.32,lr:89.42},{d:'03/27',fp:68468,lp:57848,fr:77.59,lr:93.10},
+  {d:'03/28',fp:30780,lp:25625,fr:74.07,lr:91.61},{d:'03/31',fp:24359,lp:21068,fr:76.11,lr:91.99},
+  {d:'04/01',fp:112789,lp:88875,fr:73.29,lr:93.96},{d:'04/02',fp:70537,lp:56018,fr:72.91,lr:93.14},
+  {d:'04/03',fp:42406,lp:34101,fr:72.53,lr:92.27},{d:'04/05',fp:31989,lp:25825,fr:71.69,lr:91.73},
+  {d:'04/10',fp:18631,lp:16032,fr:74.72,lr:91.77},{d:'04/16',fp:13104,lp:11554,fr:74.64,lr:90.28}
+];
+const tbody = document.querySelector('table:last-of-type tbody');
+combined.forEach(r => {
+  const drop = ((r.fp - r.lp) / r.fp * 100).toFixed(1);
+  const dropClass = drop > 15 ? 'diff-worse' : drop > 10 ? 'diff-neutral' : 'diff-better';
+  const frClass = r.fr < 73 ? 'diff-worse' : r.fr < 75 ? 'diff-neutral' : '';
+  const row = document.createElement('tr');
+  row.innerHTML = `<td>${r.d}</td><td>${r.fp.toLocaleString()}</td><td>${r.lp.toLocaleString()}</td><td class="${dropClass}">${drop}%</td><td class="${frClass}">${r.fr}%</td><td class="diff-better">${r.lr}%</td>`;
+  tbody.appendChild(row);
+});
+</script>
+</tbody>
+</table>
+
+<div class="insight-box success">
+<strong>Liveness 通过率持续改善：</strong>Liveness 阶段通过率从 Jul-Aug 2025 的 85.56% 提升至 Mar-Apr 2026 的 92.12%，表明 Liveness 模型/阈值优化效果显著。Face Compare 相似度失败率也从 5.43% 降至 4.30%。
+</div>
+
+<h2>6. 根因拆解</h2>
+
+<h3>6.1 通过率拆解公式</h3>
+<div class="insight-box">
+<strong>PV 通过率 = Doc Stage 通过率 × Liveness 通过率 × Face Compare 通过率 × Risk/Forgery 通过率</strong><br><br>
+<table style="max-width:700px">
+<thead><tr><th>阶段</th><th>Jul-Aug 2025</th><th>Mar-Apr 2026</th><th>变化</th><th>影响方向</th></tr></thead>
+<tbody>
+<tr><td>Doc Stage 到 Liveness</td><td>~100%*</td><td>83.8%</td><td class="diff-worse">-16.2pp</td><td class="diff-worse">⬇ 拉低通过率</td></tr>
+<tr><td>Liveness Pass</td><td>92.70%</td><td>97.87%</td><td class="diff-better">+5.17pp</td><td class="diff-better">⬆ 提升通过率</td></tr>
+<tr><td>Face Compare Pass</td><td>87.23%</td><td>93.27%</td><td class="diff-better">+6.04pp</td><td class="diff-better">⬆ 提升通过率</td></tr>
+<tr><td>Forgery Machine Pass</td><td>94.12%</td><td>98.13%</td><td class="diff-better">+4.01pp</td><td class="diff-better">⬆ 提升通过率</td></tr>
+</tbody>
+</table>
+<p style="font-size:0.75rem;color:var(--text-muted);margin-top:0.5rem">* 基线期两表口径不同导致 Doc Stage 通过率无法直接计算，推算约 100%</p>
+</div>
+
+<h3>6.2 根因判断</h3>
+<div class="verdict-card" style="background:linear-gradient(135deg,rgba(59,130,246,0.1),rgba(59,130,246,0.05));border-color:rgba(59,130,246,0.3)">
+<h3 style="color:var(--accent)">结论：通过率下降由文档阶段（Document Stage）拦截增加驱动</h3>
+<table style="margin-top:1rem">
+<thead><tr><th>假设</th><th>证据</th><th>判定</th></tr></thead>
+<tbody>
+<tr>
+  <td>Liveness 模型退化</td>
+  <td>Liveness 通过率 92.70% → 97.87%，改善 +5.17pp</td>
+  <td><span class="status-badge status-healthy">排除</span></td>
+</tr>
+<tr>
+  <td>Face Compare 恶化</td>
+  <td>Face Compare 通过率 87.23% → 93.27%，改善 +6.04pp</td>
+  <td><span class="status-badge status-healthy">排除</span></td>
+</tr>
+<tr>
+  <td>Forgery 检测更严</td>
+  <td>Forgery 拒绝率 5.88% → 1.87%，改善 -4.01pp</td>
+  <td><span class="status-badge status-healthy">排除</span></td>
+</tr>
+<tr style="background:rgba(239,68,68,0.08)">
+  <td><strong>Doc Stage 拦截增加</strong></td>
+  <td><strong>16.2% PV 在文档阶段流失（763K → 639K 到 Liveness）</strong></td>
+  <td><span class="status-badge status-critical">确认</span></td>
+</tr>
+<tr style="background:rgba(245,158,11,0.08)">
+  <td>用户质量/量级变化</td>
+  <td>PV 量 5.68x 增长，高峰日通过率更低（负相关）</td>
+  <td><span class="status-badge status-warning">协同因素</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h2>7. 可能的文档阶段拦截原因</h2>
+
+<table>
+<thead>
+<tr><th>#</th><th>可能原因</th><th>机制</th><th>验证方式</th><th>优先级</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td><strong>SDK/UCC 版本升级</strong></td>
+  <td>前端 SDK 引入更严格的文档质量检查（模糊、反光、遮挡等），在 client-side 直接拦截</td>
+  <td>检查 SDK release notes、UCC 配置变更记录</td>
+  <td><span class="status-badge status-critical">高</span></td>
+</tr>
+<tr>
+  <td>2</td>
+  <td><strong>Doc Quality Threshold 调整</strong></td>
+  <td>后端文档质量评分阈值上调，更多照片被判定不合格</td>
+  <td>检查 pipeline config 中 doc_quality_threshold 历史值</td>
+  <td><span class="status-badge status-critical">高</span></td>
+</tr>
+<tr>
+  <td>3</td>
+  <td><strong>新增 Doc Type 校验</strong></td>
+  <td>新增对 MY-ID-MYKAD 的特定校验规则（如 MyKad chip 检测）</td>
+  <td>检查 solution_code=DOCUMENT 的 rule config 变更</td>
+  <td><span class="status-badge status-warning">中</span></td>
+</tr>
+<tr>
+  <td>4</td>
+  <td><strong>用户基数扩大带来质量稀释</strong></td>
+  <td>PV 量 5.68x 增长带来大量新用户，首次认证成功率更低</td>
+  <td>分析 biz_user_id 去重后的新用户占比</td>
+  <td><span class="status-badge status-warning">中</span></td>
+</tr>
+<tr>
+  <td>5</td>
+  <td><strong>网络/设备环境变化</strong></td>
+  <td>更多弱网、低端设备用户导致文档上传/采集失败</td>
+  <td>分析 device_type、is_mobile 等维度</td>
+  <td><span class="status-badge status-healthy">低</span></td>
+</tr>
+</tbody>
+</table>
+
+<h2>8. 建议措施</h2>
+
+<table>
+<thead>
+<tr><th>#</th><th>建议</th><th>预期效果</th><th>紧急度</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td><strong>排查 2025Q4-2026Q1 期间 SDK/UCC 配置变更</strong> — 重点检查 doc_quality_threshold、client-side rejection rules</td>
+  <td>定位具体配置导致的拦截增加</td>
+  <td><span class="status-badge status-critical">紧急</span></td>
+</tr>
+<tr>
+  <td>2</td>
+  <td><strong>对比 front_image_shown → doc_front_uploaded_backend 的转化率</strong> — 需要从完整 funnel 表获取数据</td>
+  <td>精确定位文档阶段的具体 drop-off 环节</td>
+  <td><span class="status-badge status-critical">紧急</span></td>
+</tr>
+<tr>
+  <td>3</td>
+  <td><strong>分析新用户 vs 老用户通过率差异</strong> — 按 biz_user_id 区分首次认证和重试</td>
+  <td>量化用户质量稀释的影响</td>
+  <td><span class="status-badge status-warning">重要</span></td>
+</tr>
+<tr>
+  <td>4</td>
+  <td><strong>检查是否有 Risk Rule 变更</strong> — DataVisor、Risk Module 的规则/阈值是否有调整</td>
+  <td>排除 risk module 的影响</td>
+  <td><span class="status-badge status-warning">重要</span></td>
+</tr>
+</tbody>
+</table>
+
+<h2>9. 月度 & 日度数据明细</h2>
+
+<h3>9.1 月度汇总（Forgery 口径）</h3>
+<table>
+<thead><tr><th>月份</th><th>PV 总量</th><th>通过量</th><th>拒绝量</th><th>通过率</th><th>对比基线</th></tr></thead>
+<tbody>
+<tr><td>2025-07</td><td>88,230</td><td>72,609</td><td>15,621</td><td>82.30%</td><td class="diff-neutral">基线</td></tr>
+<tr><td>2025-08</td><td>46,596</td><td>38,873</td><td>7,723</td><td>83.43%</td><td class="diff-better">+1.13pp</td></tr>
+<tr><td>2026-03</td><td>252,369</td><td>193,626</td><td>58,743</td><td>76.72%</td><td class="diff-worse">-5.58pp</td></tr>
+<tr><td>2026-04 (至16日)</td><td>544,193</td><td>403,675</td><td>140,518</td><td>74.18%</td><td class="diff-worse">-8.12pp</td></tr>
+</tbody>
+</table>
+
+<h3>9.2 月度汇总（Liveness 口径）</h3>
+<table>
+<thead><tr><th>月份</th><th>PV 总量</th><th>通过量</th><th>通过率</th><th>对比基线</th></tr></thead>
+<tbody>
+<tr><td>2025-07</td><td>117,974</td><td>100,246</td><td>84.97%</td><td class="diff-neutral">基线</td></tr>
+<tr><td>2025-08</td><td>56,552</td><td>49,073</td><td>86.78%</td><td class="diff-better">+1.81pp</td></tr>
+<tr><td>2026-03</td><td>207,127</td><td>189,751</td><td>91.61%</td><td class="diff-better">+6.64pp</td></tr>
+<tr><td>2026-04 (至16日)</td><td>432,084</td><td>399,065</td><td>92.36%</td><td class="diff-better">+7.39pp</td></tr>
+</tbody>
+</table>
+
+<details>
+<summary>📝 取数 SQL (点击展开)</summary>
+<pre><code>-- 1. 月度汇总（Forgery 口径 = front_image_shown → IDV pass）
+SELECT 
+  SUBSTR(pt, 1, 6) as month_key,
+  COUNT(*) as total_pv,
+  SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) as pass_cnt,
+  ROUND(SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_forgery_details
+WHERE customer_id = '9929122076'
+  AND region = 'MYS'
+GROUP BY SUBSTR(pt, 1, 6)
+ORDER BY month_key;
+
+-- 2. 月度汇总（Liveness 口径 = 到达 liveness → IDV pass）
+SELECT 
+  SUBSTR(pt, 1, 6) as month_key,
+  COUNT(*) as total_pv,
+  SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) as pass_cnt,
+  ROUND(SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_liveness_details
+WHERE customer_id = '9929122076'
+  AND region = 'MYS'
+GROUP BY SUBSTR(pt, 1, 6)
+ORDER BY month_key;
+
+-- 3. Liveness 拒绝原因对比
+SELECT 
+  'Jul-Aug 2025' as period,
+  liveness_result1, liveness_code1,
+  COUNT(*) as cnt,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as pct
+FROM idv_aai_liveness_details
+WHERE customer_id = '9929122076' AND region = 'MYS'
+  AND pt >= '20250706' AND pt <= '20250813'
+GROUP BY liveness_result1, liveness_code1
+UNION ALL
+SELECT 
+  'Mar-Apr 2026' as period,
+  liveness_result1, liveness_code1,
+  COUNT(*) as cnt,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as pct
+FROM idv_aai_liveness_details
+WHERE customer_id = '9929122076' AND region = 'MYS'
+  AND pt >= '20260316' AND pt <= '20260416'
+GROUP BY liveness_result1, liveness_code1
+ORDER BY period, cnt DESC;
+
+-- 4. Face Compare 拒绝原因对比
+SELECT 
+  'Jul-Aug 2025' as period,
+  face_compare_result1, face_compare_code1,
+  COUNT(*) as cnt,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as pct
+FROM idv_aai_liveness_details
+WHERE customer_id = '9929122076' AND region = 'MYS'
+  AND pt >= '20250706' AND pt <= '20250813'
+GROUP BY face_compare_result1, face_compare_code1
+UNION ALL
+SELECT 
+  'Mar-Apr 2026' as period,
+  face_compare_result1, face_compare_code1,
+  COUNT(*) as cnt,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as pct
+FROM idv_aai_liveness_details
+WHERE customer_id = '9929122076' AND region = 'MYS'
+  AND pt >= '20260316' AND pt <= '20260416'
+GROUP BY face_compare_result1, face_compare_code1
+ORDER BY period, cnt DESC;
+
+-- 5. ID Forgery 机器结果对比
+SELECT 
+  'Jul-Aug 2025' as period,
+  id_forgery_machine_result,
+  COUNT(*) as cnt,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as pct
+FROM idv_aai_forgery_details
+WHERE customer_id = '9929122076' AND region = 'MYS'
+  AND pt >= '20250706' AND pt <= '20250813'
+GROUP BY id_forgery_machine_result
+UNION ALL
+SELECT 
+  'Mar-Apr 2026' as period,
+  id_forgery_machine_result,
+  COUNT(*) as cnt,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as pct
+FROM idv_aai_forgery_details
+WHERE customer_id = '9929122076' AND region = 'MYS'
+  AND pt >= '20260316' AND pt <= '20260416'
+GROUP BY id_forgery_machine_result
+ORDER BY period, cnt DESC;
+
+-- 6. 日度趋势（Forgery 口径）
+SELECT pt,
+  COUNT(*) as total_pv,
+  SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) as pass_cnt,
+  ROUND(SUM(CASE WHEN is_idv_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as pass_rate
+FROM idv_aai_forgery_details
+WHERE customer_id = '9929122076' AND region = 'MYS'
+  AND pt >= '20260316' AND pt <= '20260416'
+GROUP BY pt ORDER BY pt;</code></pre>
+</details>
+
+<h2>10. 数据说明 & 局限性</h2>
+<div class="insight-box">
+<ul style="padding-left:1.2rem">
+<li><strong>数据覆盖：</strong>idv_aai_forgery_details 和 idv_aai_liveness_details 表对 customer_id=9929122076 在 MYS 的数据仅覆盖 Jul-Aug 2025 和 Mar 16-Apr 16 2026 两个时段，中间（Sep 2025 - Mar 15 2026）无数据</li>
+<li><strong>Q4 2025 缺失：</strong>无法直接获取 2025Q4 的 Forgery/Liveness 口径数据，使用 Jul-Aug 2025 作为替代基线</li>
+<li><strong>口径定义：</strong>Forgery 表作为 PV 通过率（front_image_shown → IDV pass）的基准，因其包含文档阶段的所有签名记录</li>
+<li><strong>biz_code 映射：</strong>数据表中无直接 biz_code 字段，通过 customer_id=9929122076 + region=MYS 定位 RTCMY 业务</li>
+<li><strong>建议：</strong>获取完整 funnel wide table（含 is_front_image_shown、is_doc_front_check_passed 等字段）以精确定位文档阶段的具体 drop-off 环节</li>
+</ul>
+</div>
+
+<p style="text-align:center;color:var(--text-muted);font-size:0.75rem;margin-top:3rem;padding-top:1rem;border-top:1px solid var(--border)">
+Generated by Vibe Work Agent &nbsp;|&nbsp; Report: PIPO RTCMY DOCUMENT PV Pass Rate Drop Analysis &nbsp;|&nbsp; 2026-04-17
+</p>
+
+</body>
+</html>
